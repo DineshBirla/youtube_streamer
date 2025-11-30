@@ -223,7 +223,7 @@ class StreamManager:
             input_list_path = f'/tmp/stream_{self.stream.id}_inputs.txt'
             with open(input_list_path, 'w') as f:
                 for media_file in media_files:
-                    file_path = download_s3_file(mediafile)
+                    file_path = media_file.file.path
                     
                     # If it's audio, create a static image video
                     if media_file.media_type == 'audio':

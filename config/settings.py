@@ -54,20 +54,26 @@ TEMPLATES = [
 WSGI_APPLICATION = 'config.wsgi.application'
 
 # Database Configuration
-DATABASES = {
+if config('ENVIRONMENT', default='development') == 'production':
+    DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.postgresql',
-            'NAME': config('DB_NAME', default='youtube_streamer'),
-            'USER': config('DB_USER', default='youtubestreamer'),
-            'PASSWORD': config('DB_PASSWORD', default='Dbc423Ranu'),
-            'HOST': config('DB_HOST', default='database-1.cximiskuo4fk.ap-south-1.rds.amazonaws.com'),
-            'PORT': config('DB_PORT', default='5432'),
-            'OPTIONS': {
-                'sslmode': 'require',
-            }
+            'NAME': config('DBNAME', default='youtubestreamer'),
+            'USER': config('DBUSER', default='postgres'),
+            'PASSWORD': config('DBPASSWORD', default='postgres'),
+            'HOST': config('DBHOST', default='localhost'),
+            'PORT': config('DBPORT', default='5432'),
+            'OPTIONS': {'sslmode': 'require'}  # Production SSL
         }
     }
-
+else:
+    # Development: SQLite (simple, no Docker required)
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
 AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
     {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator'},
@@ -89,7 +95,7 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 # Media files with 
 
 MEDIA_URL = '/media/'
-MEDIA_ROOT = BASE_DIR / 'media'
+MEDIA_ROOT = BASE_DIR /'media'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # Google OAuth Settings
