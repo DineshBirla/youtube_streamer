@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 def check_stream_health():
     """
     Periodic task to check health of all running streams
-    Runs every 5 minutes via Celery Beat
+    Runs every 300 minutes via Celery Beat
     """
     running_streams = Stream.objects.filter(status__in=['running', 'starting'])
     
