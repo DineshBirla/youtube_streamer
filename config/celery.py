@@ -18,10 +18,10 @@ app.autodiscover_tasks()
 
 # Celery Beat Schedule for periodic tasks
 app.conf.beat_schedule = {
-    # Check stream health every 360 minutes
+    # Check stream health every 300 minutes
     'check-stream-health': {
         'task': 'apps.streaming.tasks.check_stream_health',
-        'schedule': crontab(minute='*/360'),  # Every 360 minutes
+        'schedule': crontab(minute='*/300'),  # Every 360 minutes
     },
     # Check subscription expiry daily
     'check-subscription-expiry': {
