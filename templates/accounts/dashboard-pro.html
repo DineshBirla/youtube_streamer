@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dashboard - YouTube Streamer</title>
+    <title>Dashboard - Streamloop </title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css" rel="stylesheet">
     <style>
@@ -886,9 +886,9 @@
         <div class="dashboard-header">
             <div class="header-content">
                 <h1>Dashboard</h1>
-                <p>Welcome back! Here's your streaming overview and quick actions.</p>
+                <p>Welcome back! {{ user.username }}!</p>
             </div>
-            <a href="/stream/create/" class="btn-create">
+            <a href="{% url 'stream_create' %}" class="btn btn-primary btn-lg">
                 <i class="bi bi-plus-circle"></i> Create Stream
             </a>
         </div>
@@ -899,15 +899,15 @@
                 <div class="stat-card">
                     <i class="bi bi-broadcast-tower stat-card-icon"></i>
                     <h5><i class="bi bi-lightning-fill"></i> Active Streams</h5>
-                    <h2>3</h2>
+                    <h2 class="display-4">{{ active_streams.count }}</h2>
                     <p>Currently running</p>
-                    <a href="/streams/" class="btn-link">View All Streams →</a>
+                    <a href="{% url 'stream_list' %}" class="btn-link">View All Streams →</a>
                 </div>
 
                 <div class="stat-card">
                     <i class="bi bi-collection-play stat-card-icon"></i>
                     <h5><i class="bi bi-film"></i> Media Files</h5>
-                    <h2>24</h2>
+                    <h2 class="display-4">{{ total_media.count }}</h2>
                     <p>Videos & Audio</p>
                 </div>
 
@@ -921,7 +921,7 @@
                 <div class="stat-card">
                     <i class="bi bi-calendar-check stat-card-icon"></i>
                     <h5><i class="bi bi-clock-history"></i> Scheduled</h5>
-                    <h2>5</h2>
+                    <h2 class="display-4">{{ youtube_accounts.channel_title }}</h2>
                     <p>Upcoming streams</p>
                 </div>
             </div>
@@ -934,17 +934,28 @@
                 <div class="action-card">
                     <i class="bi bi-youtube action-card-icon" style="color: #FF0000;"></i>
                     <h5>YouTube Accounts</h5>
-                    <p>Connect or manage your YouTube channels for seamless streaming</p>
-                    <a href="/youtube/connect/" class="btn btn-danger-action">
-                        <i class="bi bi-link-45deg"></i> Connect YouTube
-                    </a>
+                    {% if youtube_accounts %}
+                        <ul class="list-unstyled">
+                            {% for account in youtube_accounts %}
+                                <li><i class="fas fa-check-circle text-success"></i> {{ account.channel_title }}</li>
+                                <a href="{% url 'disconnect_youtube' account.id %}" onclick="return confirm('Disconnect from YouTube?');" class="btn btn-outline-danger btn-sm">
+                                <i class="bi bi-unlink"></i> Disconnect
+                                </a>
+                            {% endfor %}
+                        </ul>
+                    {% else %}
+                        <p class="card-text text-muted">No connected accounts</p>
+                        <a href="{% url 'connect_youtube' %}" class="btn btn-danger">
+                            <i class="fab fa-youtube"></i> Connect YouTube
+                        </a>
+                    {% endif %}
                 </div>
 
                 <div class="action-card">
                     <i class="bi bi-cloud-upload action-card-icon" style="color: var(--primary-color);"></i>
                     <h5>Upload Media</h5>
                     <p>Add videos or audio files to build your streaming library</p>
-                    <a href="/media/upload/" class="btn btn-primary-action">
+                    <a href="{% url 'media_upload' %}" class="btn btn-primary-action">
                         <i class="bi bi-cloud-upload"></i> Upload Files
                     </a>
                 </div>
@@ -953,7 +964,7 @@
                     <i class="bi bi-calendar-plus action-card-icon" style="color: var(--success-color);"></i>
                     <h5>Schedule Stream</h5>
                     <p>Plan and schedule your broadcasts for maximum reach</p>
-                    <a href="/stream/create/" class="btn btn-success-action">
+                    <a href="{% url 'stream_create' %}" class="btn btn-success-action">
                         <i class="bi bi-calendar-plus"></i> Schedule Now
                     </a>
                 </div>
@@ -965,10 +976,11 @@
             <div class="card">
                 <div class="card-header">
                     <h5><i class="bi bi-broadcast"></i> Recent Streams</h5>
-                    <a href="/streams/" class="btn">View All</a>
+                    <a href="{% url 'stream_list' %}" class="btn">View All</a>
                 </div>
                 <div class="card-body">
-                    <div class="table-responsive">
+                    {% if recent_streams %}
+                     <div class="table-responsive">
                         <table class="table">
                             <thead>
                                 <tr>
@@ -979,50 +991,79 @@
                                 </tr>
                             </thead>
                             <tbody>
+                                 {% for stream in recent_streams %}
                                 <tr>
-                                    <td data-label="Title"><strong>Morning Music Broadcast</strong></td>
-                                    <td data-label="Status"><span class="badge badge-success"><i class="bi bi-broadcast"></i> Live</span></td>
-                                    <td data-label="Started">Dec 03, 2024 10:30</td>
-                                    <td data-label="Actions">
-                                        <a href="/stream/view/1/" class="btn-outline-primary"><i class="bi bi-eye"></i> View</a>
-                                        <a href="/stream/stop/1/" class="btn-outline-danger"><i class="bi bi-stop-circle"></i> Stop</a>
-                                    </td>
+                                    <td>
+                                    <strong>{{ stream.title }}</strong>
+                                </td>
+                                <td>
+                                    {% if stream.status == 'running' %}
+                                        <span class="badge bg-success">
+                                            <i class="bi bi-broadcast"></i> Live
+                                        </span>
+                                    {% elif stream.status == 'scheduled' %}
+                                        <span class="badge bg-warning text-dark">
+                                            <i class="bi bi-clock"></i> Scheduled
+                                        </span>
+                                    {% else %}
+                                        <span class="badge bg-secondary">
+                                            <i class="bi bi-stop-circle"></i> Stopped
+                                        </span>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    {% if stream.started_at %}
+                                        {{ stream.started_at|date:"M d, Y H:i" }}
+                                    {% else %}
+                                        -
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    <a href="{% url 'stream_detail' stream.id %}" class="btn btn-sm btn-outline-primary">
+                                        <i class="bi bi-eye"></i> View
+                                    </a>
+                                    {% if stream.status == 'running' %}
+                                        <a href="{% url 'stream_stop' stream.id %}" class="btn btn-sm btn-outline-danger">
+                                            <i class="bi bi-stop-circle"></i> Stop
+                                        </a>
+                                    {% endif %}
+                                </td>
                                 </tr>
-                                <tr>
-                                    <td data-label="Title"><strong>Evening Podcast Session</strong></td>
-                                    <td data-label="Status"><span class="badge badge-warning"><i class="bi bi-clock"></i> Scheduled</span></td>
-                                    <td data-label="Started">Dec 03, 2024 18:00</td>
-                                    <td data-label="Actions">
-                                        <a href="/stream/view/2/" class="btn-outline-primary"><i class="bi bi-eye"></i> View</a>
-                                    </td>
-                                </tr>
-                                <tr>
-                                    <td data-label="Title"><strong>Devotional Bhajan Stream</strong></td>
-                                    <td data-label="Status"><span class="badge badge-secondary"><i class="bi bi-stop-circle"></i> Stopped</span></td>
-                                    <td data-label="Started">Dec 02, 2024 19:45</td>
-                                    <td data-label="Actions">
-                                        <a href="/stream/view/3/" class="btn-outline-primary"><i class="bi bi-eye"></i> View</a>
-                                    </td>
-                                </tr>
-                            </tbody>
-                        </table>
-                    </div>
+                              {% endfor %}
+                        </tbody>
+                    </table>
                 </div>
-            </div>
-        </div>
-
-        <!-- Subscription Info -->
-        <div class="subscription-card" style="margin-top: 40px;">
-            <h5><i class="bi bi-star-fill" style="color: #ffc107;"></i> Premium Plan</h5>
-            <div class="subscription-content">
-                <p><strong>Max Streams:</strong> Unlimited | <strong>Expires:</strong> Dec 31, 2024</p>
-                <a href="/subscription/" class="btn-outline-primary-sub">
-                    <i class="bi bi-arrow-up-circle"></i> Manage Plan
-                </a>
-            </div>
+            {% else %}
+                <div class="text-center py-5">
+                    <i class="bi bi-broadcast" style="font-size: 4rem; color: var(--text-secondary); opacity: 0.3;"></i>
+                    <p class="text-muted mt-3 mb-0">No streams yet. Create your first stream!</p>
+                </div>
+            {% endif %}
         </div>
     </div>
 
+        <!-- Subscription Info -->
+       {% if subscription %}
+    <div class="card">
+        <div class="card-body">
+            <div class="row align-items-center">
+                <div class="col-md-8">
+                    <h5 class="mb-2">
+                        <i class="bi bi-star-fill text-warning"></i> {{ subscription.plan_type|title }} Plan
+                    </h5>
+                    <p class="text-muted mb-0">
+                        <strong>Max Streams:</strong> {{ subscription.max_streams }} | 
+                        <strong>Expires:</strong> {{ subscription.end_date|date:"M d, Y" }}
+                    </p>
+                </div>
+                <div class="col-md-4 text-end">
+                    <a href="{% url 'subscribe' %}" class="btn btn-outline-primary">
+                        <i class="bi bi-arrow-up-circle"></i> Upgrade Plan
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
     <script>
         // Smooth animations and interactions
         document.addEventListener('DOMContentLoaded', function() {
