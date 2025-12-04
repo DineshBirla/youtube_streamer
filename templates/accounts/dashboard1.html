@@ -1,3 +1,8 @@
+{% extends 'base.html' %}
+
+{% block title %}Dashboard - YouTube Streamer{% endblock %}
+
+{% block content %}
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1063,7 +1068,9 @@
                 </div>
             </div>
         </div>
+        {% endif %}
     </div>
+    
     <script>
         // Smooth animations and interactions
         document.addEventListener('DOMContentLoaded', function() {
@@ -1128,3 +1135,4 @@
     </script>
 </body>
 </html>
+{% endblock %}   

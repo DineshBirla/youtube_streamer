@@ -614,8 +614,8 @@
                     </div>
                 </div>
 
-                <h4 class="profile-name">John Streamer</h4>
-                <p class="profile-email">john@youtube.com</p>
+                <h4 class="profile-name">{{ user.username }}</h4>
+                <p class="profile-email">{{ user.email }}</p>
 
                 <div class="profile-status">
                     <i class="bi bi-star-fill"></i> Premium Member
@@ -638,7 +638,7 @@
                     <span class="profile-stat-value">Dec 2024</span>
                 </div>
 
-                <a href="/logout/" class="btn-logout">
+                <a href="{% url 'logout' %}" class="btn-logout">
                     <i class="bi bi-box-arrow-right"></i> Logout
                 </a>
             </div>
@@ -652,86 +652,41 @@
                         <h5>Edit Profile</h5>
                     </div>
                     <div class="form-card-body">
-                        <form id="profileForm" method="post" action="/api/profile/" novalidate>
-                            <div class="form-row">
-                                <div class="form-group">
-                                    <label for="username" class="form-label">
-                                        <i class="bi bi-person"></i> Username
-                                    </label>
-                                    <input 
-                                        type="text" 
-                                        class="form-control" 
-                                        id="username" 
-                                        name="username" 
-                                        placeholder="Your username"
-                                        value="john_streamer"
-                                        required
-                                    >
-                                    <div class="invalid-feedback"></div>
-                                </div>
+                        <form method="post">
+                            {% csrf_token %}
 
-                                <div class="form-group">
-                                    <label for="email" class="form-label">
-                                        <i class="bi bi-envelope"></i> Email
-                                    </label>
-                                    <input 
-                                        type="email" 
-                                        class="form-control" 
-                                        id="email" 
-                                        name="email" 
-                                        placeholder="your@email.com"
-                                        value="john@youtube.com"
-                                        required
-                                    >
-                                    <div class="invalid-feedback"></div>
-                                </div>
-                            </div>
-
-                            <div class="form-group">
-                                <label for="phone" class="form-label">
-                                    <i class="bi bi-telephone"></i> Phone Number
+                           <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label for="id_username" class="form-label">
+                                    <i class="bi bi-person"></i> Username
                                 </label>
-                                <input 
-                                    type="tel" 
-                                    class="form-control" 
-                                    id="phone" 
-                                    name="phone" 
-                                    placeholder="+1234567890"
-                                    value="+91-9876543210"
-                                >
-                                <div class="invalid-feedback"></div>
+                                <input type="text" class="form-control" id="id_username" name="username" value="{{ user.username }}" required>
                             </div>
-
-                            <div class="form-group">
-                                <label for="bio" class="form-label">
-                                    <i class="bi bi-chat-square-text"></i> Bio
+                            <div class="col-md-6 mb-3">
+                                <label for="id_email" class="form-label">
+                                    <i class="bi bi-envelope"></i> Email
                                 </label>
-                                <textarea 
-                                    class="form-control" 
-                                    id="bio" 
-                                    name="bio" 
-                                    rows="3"
-                                    placeholder="Tell us about yourself..."
-                                    maxlength="200"
-                                >Music lover, Content Creator, Tech Enthusiast</textarea>
-                                <small class="form-text text-muted">
-                                    <span id="charCount">42</span>/200 characters
-                                </small>
+                                <input type="email" class="form-control" id="id_email" name="email" value="{{ user.email }}" required>
                             </div>
+                        </div>
 
-                            <div class="btn-group">
-                                <button type="button" class="btn-cancel" onclick="resetForm()">
-                                    <i class="bi bi-x-circle"></i> Cancel
-                                </button>
-                                <button type="submit" class="btn-save">
-                                    <i class="bi bi-check-circle"></i> Save Changes
-                                </button>
-                            </div>
+                        <div class="mb-3">
+                            <label for="id_phone" class="form-label">
+                                <i class="bi bi-telephone"></i> Phone
+                            </label>
+                            <input type="text" class="form-control" id="id_phone" name="phone" value="{{ profile.phone|default:'' }}">
+                        </div>
+
+                        <div class="text-end">
+                            <button type="submit" class="btn btn-primary">
+                                <i class="bi bi-check-circle"></i> Save Changes
+                            </button>
+                        </div>
                         </form>
                     </div>
                 </div>
 
-                <!-- Change Password Form -->
+                <!-- Change Password Form 
                 <div class="form-card">
                     <div class="form-card-header">
                         <i class="bi bi-shield-lock"></i>
@@ -801,7 +756,7 @@
             </div>
         </div>
     </div>
-
+-->
     <script>
         // Character counter for bio
         document.getElementById('bio').addEventListener('input', function() {

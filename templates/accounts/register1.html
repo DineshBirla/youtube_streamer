@@ -1,5 +1,4 @@
-{% extends 'base.html' %}
-{% block content %}
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -406,7 +405,7 @@
                 <h3>Create Your Account</h3>
             </div>
             <div class="card-body">
-                <form id="registerForm" method="post" action="/api/register/" novalidate>
+                <form method="post" novalidate>
                     {% csrf_token %}
                     <!-- Username and Email Row -->
                     <div class="row-custom">

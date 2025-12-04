@@ -200,3 +200,23 @@ def disconnect_youtube(request, account_id):
         f"Disconnected {yt_account.channel_title}. {active_streams.count()} stream(s) stopped."
     )
     return redirect('dashboard')
+
+from django.shortcuts import render
+
+from django.shortcuts import render
+
+def about_view(request):
+    return render(request, "accounts/about.html")
+
+
+def privacy_policy_view(request):
+    return render(request, "accounts/policy.html")
+
+
+def terms_view(request):
+    return render(request, "accounts/terms.html")
+
+
+def support_view(request):
+    return render(request, "accounts/support.html")
+
