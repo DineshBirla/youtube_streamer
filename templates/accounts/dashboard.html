@@ -643,9 +643,6 @@
       </div>
       <div class="stat-card-title">YouTube Accounts</div>
       <div class="stat-card-value">{{ youtube_accounts.count|default:"0" }}</div>
-      <a href="{% url 'connect_youtube' %}" class="stat-card-action">
-        Connect <i class="bi bi-arrow-right"></i>
-      </a>
     </div>
 
     <div class="stat-card stat-card-gradient-4 slide-in" style="animation-delay: 0.3s;">
@@ -667,17 +664,21 @@
         <i class="bi bi-youtube" style="color: #FF0000;"></i>
       </div>
       <h5>YouTube Accounts</h5>
-      {% if youtube_accounts %}
-        <p>{{ youtube_accounts.count }} account{% if youtube_accounts.count != 1 %}s{% endif %} connected</p>
-        <a href="{% url 'connect_youtube' %}" class="btn-action">
-          <i class="bi bi-plus-circle"></i> Add Account
-        </a>
-      {% else %}
-        <p>Connect your YouTube channel to start streaming</p>
-        <a href="{% url 'connect_youtube' %}" class="btn-action">
-          <i class="bi bi-link-45deg"></i> Connect YouTube
-        </a>
-      {% endif %}
+          {% if youtube_accounts %}
+                        <ul class="list-unstyled">
+                            {% for account in youtube_accounts %}
+                                <li><i class="fas fa-check-circle text-success"></i> {{ account.channel_title }}</li>
+                                <a href="{% url 'disconnect_youtube' account.id %}" onclick="return confirm('Disconnect from YouTube?');" class="btn btn-outline-danger btn-sm">
+                                <i class="bi bi-unlink"></i> Disconnect
+                                </a>
+                            {% endfor %}
+                        </ul>
+                    {% else %}
+                        <p class="card-text text-muted">No connected accounts</p>
+                        <a href="{% url 'connect_youtube' %}" class="btn btn-danger">
+                            <i class="fab fa-youtube"></i> Connect YouTube
+                        </a>
+                    {% endif %}
     </div>
 
     <div class="action-card">
