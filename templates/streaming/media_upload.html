@@ -9,7 +9,7 @@
     animation: fadeInUp 0.6s ease-out;
     padding: 2rem 0;
   }
-
+ 
   /* ==================== Page Header ==================== */
   .upload-header {
     text-align: center;
@@ -428,19 +428,13 @@
                   <span class="required">*</span>
                   <span class="form-help-text">Select whether this is a video or audio file</span>
                 </label>
-                <select
-                  class="form-select {% if form.media_type.errors %}is-invalid{% endif %}"
-                  id="{{ form.media_type.id_for_label }}"
-                  name="media_type"
-                  required
-                >
-                  <option value="default='video'>Select media type...</option>
-                  <option value="video" {% if form.media_type.value == 'video' %}selected{% endif %}>
-                    🎬 Video
-                  </option>
-                  <!--<option value="audio" {% if form.media_type.value == 'audio' %}selected{% endif %}>
-                    🎵 Audio
-                  </option> -->
+                <select class="form-select {% if form.media_type.errors %}is-invalid{% endif %}" 
+                                    id="{{ form.media_type.id_for_label }}" 
+                                    name="media_type"
+                                    required>
+                                <option value="">Select media type</option>
+                                <option value="video" {% if form.media_type.value == 'video' %}selected{% endif %}>Video</option>
+                                <option value="audio" {% if form.media_type.value == 'audio' %}selected{% endif %}>Audio</option>
                 </select>
                 {% if form.media_type.errors %}
                   <div class="invalid-feedback">

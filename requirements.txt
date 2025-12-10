@@ -16,4 +16,7 @@ gunicorn==21.2.0
 django-celery-beat==2.6.0
 flower==2.0.1
 psutil
+django-storages 
+boto3 
+django-filter
 
