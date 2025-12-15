@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 import requests
 import tempfile
+import threading
+from celery import shared_task
+from django.apps import apps
 
 def download_s3_file(mediafile):
     url = mediafile.file.url
@@ -211,7 +214,7 @@ class StreamManager:
             self.stream.error_message = str(e)
             self.stream.save()
             return None
-    
+            
     def start_ffmpeg_stream(self):
         """Start FFmpeg streaming process"""
         try:
@@ -223,42 +226,77 @@ class StreamManager:
             input_list_path = f'/tmp/stream_{self.stream.id}_inputs.txt'
             with open(input_list_path, 'w') as f:
                 for media_file in media_files:
-                    file_path = media_file.file.url
-                    
-                    
-                    # If it's audio, create a static image video
-                    if media_file.media_type == 'audio':
-                        if media_file.thumbnail:
-                            f.write(f"file '{file_path}'\n")
-                        else:
-                            # Use a black screen if no thumbnail
-                            f.write(f"file '{file_path}'\n")
-                    else:
-                        f.write(f"file '{file_path}'\n")
+                    file_path = download_s3_file(media_file)
+
+                    # write input list entries (audio/video treated same here)
+                    f.write(f"file '{file_path}'\n")
             
-            # FFmpeg command for streaming
-            ffmpeg_cmd = [
+            # Create a single MPEG-TS concat with monotonic timestamps (genpts) to avoid PTS resets
+            temp_concat = f'/tmp/stream_{self.stream.id}_concat.ts'
+            concat_cmd = [
                 settings.FFMPEG_PATH,
-                '-re',  # Read input at native frame rate
-                '-stream_loop', '-1' if self.stream.loop_enabled else '0',  # Loop infinitely
                 '-f', 'concat',
                 '-safe', '0',
                 '-i', input_list_path,
-                '-c:v', 'libx264',  # Video codec
-                '-preset', 'veryfast',  # Encoding speed
-                '-b:v', '3000k',  # Video bitrate
+                '-fflags', '+genpts',
+                '-avoid_negative_ts', 'make_zero',
+                '-c:v', 'libx264',
+                '-preset', 'veryfast',
+                '-b:v', '3000k',
+                '-maxrate', '3000k',
+                '-bufsize', '6000k',
+                '-g', '50',
+                '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-ar', '44100',
+                '-f', 'mpegts',
+                temp_concat
+            ]
+
+            logger.info('Creating MPEG-TS concatenated temp file: %s', temp_concat)
+            proc_concat = subprocess.run(concat_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if proc_concat.returncode != 0:
+                # Try stream copy (may fail if codecs/params differ)
+                copy_concat_cmd = [
+                    settings.FFMPEG_PATH,
+                    '-f', 'concat',
+                    '-safe', '0',
+                    '-i', input_list_path,
+                    '-c', 'copy',
+                    '-f', 'mpegts',
+                    temp_concat
+                ]
+                proc_copy = subprocess.run(copy_concat_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if proc_copy.returncode == 0:
+                    logger.info('TS concat created with stream copy')
+                else:
+                    logger.warning('TS stream copy concat failed, re-encode stderr: %s', proc_copy.stderr)
+                    logger.error('Concat creation failed (re-encode): %s', proc_concat.stderr)
+                    raise RuntimeError(f'Failed to create TS concat file: {proc_concat.stderr}\n{proc_copy.stderr}')
+
+            # FFmpeg command for streaming: use TS input with genpts to preserve monotonic timestamps
+            ffmpeg_cmd = [
+                settings.FFMPEG_PATH,
+                '-re',
+                '-fflags', '+genpts',
+                '-stream_loop', '-1' if self.stream.loop_enabled else '0',
+                '-i', temp_concat,
+                '-c:v', 'libx264',
+                '-preset', 'veryfast',
+                '-b:v', '3000k',
                 '-maxrate', '3000k',
                 '-bufsize', '6000k',
                 '-pix_fmt', 'yuv420p',
-                '-g', '60',  # GOP size
-                '-c:a', 'aac',  # Audio codec
-                '-b:a', '128k',  # Audio bitrate
-                '-ar', '44100',  # Audio sample rate
-                '-f', 'flv',  # Output format
+                '-g', '50',
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-ar', '44100',
+                '-f', 'flv',
                 self.stream.stream_url
-            ] 
-           
-            # Start FFmpeg process
+            ]
+
+            # Start FFmpeg process and stream stderr to logger so we can see errors when it stops
             process = subprocess.Popen(
                 ffmpeg_cmd,
                 stdout=subprocess.PIPE,
@@ -266,6 +304,82 @@ class StreamManager:
                 preexec_fn=os.setsid,
                 universal_newlines=True
             )
+
+            def _log_stream(pipe, level=logging.INFO):
+                try:
+                    for line in iter(pipe.readline, ''):
+                        if line:
+                            logger.log(level, line.strip())
+                except Exception:
+                    pass
+
+            t = threading.Thread(target=_log_stream, args=(process.stderr, logging.ERROR), daemon=True)
+            t.start()
+
+            # Monitor thread: watch ffmpeg, attempt auto-restarts, update DB, and cleanup
+            def _monitor_ffmpeg(p, cmd, max_restarts=3):
+                restarts = 0
+                cur_proc = p
+                while True:
+                    ret = cur_proc.wait()
+                    logger.error('ffmpeg exited with code %s for stream %s (attempt %s)', ret, self.stream.id, restarts)
+
+                    # If clean stop (ret==0) or we've exhausted restarts, mark and exit loop
+                    if ret == 0 or restarts >= max_restarts:
+                        try:
+                            self.stream.process_id = None
+                            if ret == 0:
+                                self.stream.status = 'stopped'
+                                self.stream.error_message = ''
+                            else:
+                                self.stream.status = 'error'
+                                self.stream.error_message = f'ffmpeg exited with code {ret} after {restarts} restarts'
+                            self.stream.stopped_at = datetime.now()
+                            self.stream.save(update_fields=['process_id', 'status', 'stopped_at', 'error_message'])
+                        except Exception as e:
+                            logger.exception('Failed to update stream after ffmpeg exit: %s', e)
+                        break
+
+                    # Attempt restart
+                    restarts += 1
+                    backoff = 5 * restarts
+                    logger.info('Restarting ffmpeg for stream %s (attempt %s) after %ss', self.stream.id, restarts, backoff)
+                    time.sleep(backoff)
+                    try:
+                        new_proc = subprocess.Popen(
+                            cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            preexec_fn=os.setsid,
+                            universal_newlines=True
+                        )
+                        cur_proc = new_proc
+                        # update DB process_id
+                        try:
+                            self.stream.process_id = new_proc.pid
+                            self.stream.status = 'running'
+                            self.stream.save(update_fields=['process_id', 'status'])
+                        except Exception:
+                            logger.exception('Failed to update stream process_id on restart')
+
+                        # spawn a stderr logger for this restarted process
+                        t2 = threading.Thread(target=_log_stream, args=(new_proc.stderr, logging.ERROR), daemon=True)
+                        t2.start()
+                    except Exception as e:
+                        logger.exception('Failed to restart ffmpeg for stream %s: %s', self.stream.id, e)
+                        continue
+
+                # cleanup temp files when final
+                try:
+                    if os.path.exists(temp_concat):
+                        os.remove(temp_concat)
+                    if os.path.exists(input_list_path):
+                        os.remove(input_list_path)
+                except Exception:
+                    logger.exception('Failed to remove temp files for stream %s', self.stream.id)
+
+            monitor_t = threading.Thread(target=_monitor_ffmpeg, args=(process, ffmpeg_cmd), daemon=True)
+            monitor_t.start()
             
             self.stream.process_id = process.pid
             self.stream.status = 'running'
@@ -281,6 +395,21 @@ class StreamManager:
             self.stream.error_message = str(e)
             self.stream.save()
             return None
+
+
+# Module-level task that Celery should call. It looks up the Stream model by id,
+# creates a StreamManager and runs the instance method. This avoids decorating
+# the instance method with @shared_task which causes the missing-self error.
+@shared_task(time_limit=86400, soft_time_limit=86100)
+def start_ffmpeg_stream_task(stream_id):
+    try:
+        Stream = apps.get_model('streaming', 'Stream')
+        stream = Stream.objects.get(pk=stream_id)
+        manager = StreamManager(stream)
+        return manager.start_ffmpeg_stream()
+    except Exception as e:
+        logger.exception('Failed to start ffmpeg stream task for id %s: %s', stream_id, e)
+        raise
     
     def stop_ffmpeg_gracefully(self, pid):
         """Stop FFmpeg process group"""

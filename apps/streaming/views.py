@@ -134,7 +134,6 @@ def oauth_callback(request):
             channel = channel_response['items'][0]
             channel_id = channel['id']
             channel_title = channel['snippet']['title']
-
             # Save or update YouTube account
             youtube_account, created = YouTubeAccount.objects.update_or_create(
                 user=request.user,
@@ -314,7 +313,6 @@ def stream_start(request, stream_id):
 def upload_thumbnail_to_youtube(stream, video_id):
     """Upload thumbnail to YouTube using the Thumbnails.set API endpoint"""
     youtube_account = stream.youtube_account
-
     # Build credentials
     credentials = Credentials(
         token=youtube_account.access_token,
@@ -324,10 +322,8 @@ def upload_thumbnail_to_youtube(stream, video_id):
         client_secret=settings.GOOGLE_CLIENT_SECRET,
         scopes=settings.GOOGLE_SCOPES
     )
-
     # Build YouTube service
     youtube = build('youtube', 'v3', credentials=credentials)
-
     # Upload thumbnail
     thumbnail_path = stream.thumbnail.path
     media = MediaFileUpload(thumbnail_path, mimetype='image/jpeg', resumable=True)
