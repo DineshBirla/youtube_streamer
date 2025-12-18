@@ -395,6 +395,69 @@ class StreamManager:
             self.stream.error_message = str(e)
             self.stream.save()
             return None
+    def stop_ffmpeg_gracefully(self, pid):
+        """Stop FFmpeg process group"""
+        try:
+            import sys
+            if sys.platform != 'win32':
+                # Linux/Mac: Kill entire process group
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+                time.sleep(2)
+                # Force kill if still alive
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # Already dead
+            else:
+                # Windows: Use taskkill
+                subprocess.call(['taskkill', '/F', '/T', '/PID', str(pid)])
+        
+            return True
+        except Exception as e:
+            logger.error(f"Failed to stop process group: {e}")
+            return False
+    def stop_stream(self):
+        """Completely stop FFmpeg and end YouTube broadcast cleanly"""
+        try:
+            # 1️⃣ Kill FFmpeg process locally
+            if self.stream.process_id:
+                success = self.stop_ffmpeg_gracefully(self.stream.process_id)
+                if success:
+                    logger.info(f"Stopped FFmpeg process for stream {self.stream.id}")
+                else:
+                    logger.warning(f"Manual termination required for PID {self.stream.process_id}")
+                self.stream.process_id = None
+
+            # 2️⃣ Make sure YouTube API client is ready
+            if not hasattr(self, 'youtube') or not self.youtube:
+                self.authenticate_youtube()
+
+            # 3️⃣ Mark broadcast complete on YouTube
+            if self.youtube and self.stream.broadcast_id:
+                try:
+                    self.youtube.liveBroadcasts().transition(
+                        broadcastStatus='complete',
+                        id=self.stream.broadcast_id,
+                        part='status'
+                    ).execute()
+                    logger.info(f"YouTube broadcast {self.stream.broadcast_id} ended successfully")
+                except Exception as e:
+                    logger.error(f"YouTube broadcast completion failed: {e}")
+
+            # 4️⃣ Update database
+            self.stream.status = 'stopped'
+            self.stream.stopped_at = datetime.now()
+            self.stream.save(update_fields=['status', 'stopped_at', 'process_id'])
+            return True
+
+        except Exception as e:
+            self.stream.status = 'error'
+            self.stream.error_message = str(e)
+            self.stream.save(update_fields=['status', 'error_message'])
+            logger.error(f"Error stopping stream {self.stream.id}: {e}")
+            return False        
+
+    
 
 
 # Module-level task that Celery should call. It looks up the Stream model by id,
