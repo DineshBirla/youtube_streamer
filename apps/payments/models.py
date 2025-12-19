@@ -7,7 +7,7 @@ class Subscription(models.Model):
     PLAN_CHOICES = [
         ('monthly', 'Monthly Plan'),
         ('annual', 'Annual Plan'),
-        ('oneday' , 'OneDay Plan'),
+        ('oneday', 'OneDay Plan'),
     ]
 
     STATUS_CHOICES = [
@@ -23,12 +23,11 @@ class Subscription(models.Model):
     razorpay_signature = models.CharField(max_length=255, blank=True)
     amount = models.IntegerField()  # in paise
     max_streams = models.IntegerField()
-    # NEW: Storage limit for subscription plan
-    storage_limit = models.BigIntegerField()  # in bytes (1GB = 1073741824 bytes, 2GB = 2147483648 bytes)
+    storage_limit = models.BigIntegerField()
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active')
-    is_active = models.BooleanField(default=True)
+    is_active = models.BooleanField(default=False)  # ✅ Start as inactive
     start_date = models.DateTimeField(auto_now_add=True)
-    end_date = models.DateTimeField()
+    end_date = models.DateTimeField(null=True, blank=True)  # ✅ Allow NULL initially
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -36,34 +35,52 @@ class Subscription(models.Model):
         return f"{self.user.username} - {self.plan_type} - {self.status}"
 
     def is_expired(self):
+        if not self.end_date:
+            return False
         return timezone.now() > self.end_date
 
     def get_storage_limit_display(self):
         """Display storage limit in GB"""
-        return round(self.storage_limit / (1024 ** 3), 2)  # Convert bytes to GB
+        return round(self.storage_limit / (1024 ** 3), 2)
+
+    def calculate_and_set_end_date(self):
+        """✅ NEW - Explicitly calculate end_date based on plan"""
+        from django.conf import settings
+        
+        plan_config = settings.SUBSCRIPTION_PLANS.get(self.plan_type)
+        if not plan_config:
+            raise ValueError(f"Invalid plan type: {self.plan_type}")
+        
+        duration_days = plan_config.get('duration_days', 30)
+        self.end_date = timezone.now() + timedelta(days=duration_days)
+        
+        # ✅ Also set storage limit
+        if self.plan_type == 'monthly':
+            self.storage_limit = 1 * (1024 ** 3)
+        elif self.plan_type == 'oneday':
+            self.storage_limit = 0.5 * (1024 ** 3)
+        elif self.plan_type == 'annual':
+            self.storage_limit = 2 * (1024 ** 3)
+        
+        # ✅ Also set max_streams
+        self.max_streams = plan_config.get('max_streams', 1)
 
     def save(self, *args, **kwargs):
+        # ✅ Only set if explicitly not yet set
         if not self.end_date:
-            from django.conf import settings
-            plan_config = settings.SUBSCRIPTION_PLANS.get(self.plan_type)
-            self.end_date = timezone.now() + timedelta(days=plan_config['duration_days'])
-            self.max_streams = plan_config['max_streams']
-
-            # NEW: Set storage limit based on plan type
-            
-            if self.plan_type == 'monthly':
-                self.storage_limit = 1 * (1024 ** 3)  # 1GB in bytes
-            elif self.plan_type == 'oneday':
-                self.storage_limit = 0.5 * (1024 ** 3)  # 0.5 GB in bytes
-            elif self.plan_type == 'annual':
-                self.storage_limit = 2 * (1024 ** 3)  # 2GB in bytes
-
+            self.calculate_and_set_end_date()
+        
         super().save(*args, **kwargs)
 
     class Meta:
         verbose_name = 'Subscription'
         verbose_name_plural = 'Subscriptions'
         ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', 'is_active', 'status']),
+            models.Index(fields=['end_date', 'status']),
+        ]
+
 
 class Payment(models.Model):
     subscription = models.ForeignKey(Subscription, on_delete=models.CASCADE, related_name='payments')
