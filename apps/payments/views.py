@@ -6,7 +6,8 @@ from django.http import HttpResponseBadRequest, JsonResponse
 from django.conf import settings
 import razorpay
 from .models import Subscription, Payment
-
+import logging
+logger = logging.getLogger(__name__)
 razorpay_client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
 
 @login_required
@@ -118,7 +119,13 @@ def payment_callback(request):
 
             # ✅ Verify end_date is set before activating
             if not subscription.end_date:
-                subscription.calculate_and_set_end_date()
+                from django.utils import timezone
+                from datetime import timedelta
+                plan_config = settings.SUBSCRIPTION_PLANS.get(subscription.plan_type)
+                if plan_config:
+                    duration_days = plan_config.get('duration_days', 30)
+                    subscription.end_date = timezone.now() + timedelta(days=duration_days)
+                    subscription.save()
 
             # Update subscription
             subscription.razorpay_payment_id = payment_id
@@ -151,6 +158,7 @@ def payment_callback(request):
             return redirect('payment_success')
 
         except razorpay.errors.SignatureVerificationError:
+            logger.error("Signature verification failed")  # ✅ Now works
             messages.error(request, 'Payment verification failed')
             return redirect('payment_failed')
         except Exception as e:
