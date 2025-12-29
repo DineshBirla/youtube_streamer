@@ -21,6 +21,8 @@ INSTALLED_APPS = [
     'rest_framework',
     'django_filters',
     'storages',  # ← ADD FOR S3
+    'django_celery_beat',        # ✅ ADD THIS
+    'django_celery_results',     
     'apps.accounts',
     'apps.streaming',
     'apps.payments',
@@ -202,13 +204,52 @@ SUBSCRIPTION_PLANS = {
     }
 }
 
-# ============ CELERY SETTINGS ============
-CELERY_BROKER_URL = config('CELERY_BROKER_URL', default='redis://localhost:6379/0')
-CELERY_RESULT_BACKEND = config('CELERY_RESULT_BACKEND', default='redis://localhost:6379/0')
+# Celery Broker (Message Queue)
+CELERY_BROKER_URL = config(
+    'CELERY_BROKER_URL',
+    default='redis://localhost:6379/0'
+)
+
+# Celery Result Backend (Store task results)
+CELERY_RESULT_BACKEND = config(
+    'CELERY_RESULT_BACKEND',
+    default='redis://localhost:6379/0'
+)
+
+# Serialization
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
-CELERY_TIMEZONE = TIME_ZONE
+
+# Timezone
+CELERY_TIMEZONE = TIME_ZONE  # Asia/Kolkata
+
+# Task settings
+CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
+CELERY_TASK_SOFT_TIME_LIMIT = 25 * 60  # 25 minutes
+
+# ✅ Beat Scheduler (DatabaseScheduler is more reliable)
+CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
+
+# Worker settings
+CELERYD_POOL = 'solo'  # Use solo pool for development
+# For production: use 'prefork' or 'eventlet'
+
+# Result expires after 1 hour (save memory)
+CELERY_RESULT_EXPIRES = 3600
+
+# Task queues
+CELERY_TASK_QUEUES = {
+    'celery': {
+        'exchange': 'celery',
+        'routing_key': 'celery',
+    },
+    'streaming': {
+        'exchange': 'streaming',
+        'routing_key': 'streaming',
+    },
+}
 
 # ============ FFMPEG SETTINGS ============
 FFMPEG_PATH = config('FFMPEG_PATH', default='ffmpeg')
