@@ -11,17 +11,18 @@ import json
 from typing import Optional, Dict
 from datetime import datetime, timedelta
 from pathlib import Path
-
 from django.conf import settings
 from django.apps import apps
 from django.core.cache import cache
 from django.db import transaction
 from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.errors import HttpError
 from celery import shared_task
 import io
-import os
+
 logger = logging.getLogger(__name__)
 
 # ============ CONFIGURATION ============
@@ -31,6 +32,8 @@ CHUNK_SIZE = 512 * 1024  # 512KB optimal for S3
 STREAM_BUFFER_SIZE = '50M'
 FFMPEG_TIMEOUT = 300  # 5min per operation
 MAX_STREAM_RESTARTS = 5
+BROADCAST_END_TIMEOUT = 30  # Wait max 30s for YouTube to acknowledge end
+GRACEFUL_SHUTDOWN_TIMEOUT = 10  # Time to gracefully stop FFmpeg
 CELERY_TASK_TIMEOUT = 86400  # 24 hours
 
 # Ensure temp directory exists
@@ -51,14 +54,23 @@ class StreamCache:
         """Store process info in cache"""
         cache.set(
             StreamCache.get_stream_key(stream_id),
-            {'pid': pid, 'status': status, 'started': datetime.now().isoformat()},
-            timeout=86400
+            {
+                'pid': pid,
+                'status': status,
+                'started': datetime.now().isoformat()
+            },
+            timeout=300  # 5 minutes, refresh on heartbeat
         )
     
     @staticmethod
     def get_process_info(stream_id):
         """Retrieve cached process info"""
         return cache.get(StreamCache.get_stream_key(stream_id)) or {}
+    
+    @staticmethod
+    def delete_process_info(stream_id):
+        """Delete process info from cache"""
+        cache.delete(StreamCache.get_stream_key(stream_id))
 
 
 def get_temp_dir_for_stream(stream_id):
@@ -126,7 +138,7 @@ def download_files_parallel(media_files, stream_id):
 
 
 def create_concat_file(media_files, file_paths, stream_id, loops=50):
-    """Create FFmpeg concat demuxer file"""
+    """Create FFmpeg concat demuxer file with proper escaping"""
     stream_dir = get_temp_dir_for_stream(stream_id)
     concat_path = os.path.join(stream_dir, 'concat.txt')
     
@@ -135,7 +147,8 @@ def create_concat_file(media_files, file_paths, stream_id, loops=50):
             for media_file in media_files:
                 file_path = file_paths[media_file.id]
                 # Escape special characters for FFmpeg
-                f.write(f"file '{file_path}'\n")
+                escaped = file_path.replace("\\", "\\\\").replace("'", "\\'")
+                f.write(f"file '{escaped}'\n")
     
     return concat_path
 
@@ -160,7 +173,7 @@ def resolve_ffmpeg_binary():
 # ============ STREAM MANAGER ============
 
 class StreamManager:
-    """Production-grade streaming manager with auto-restart & monitoring"""
+    """Production-grade streaming manager with graceful shutdown"""
     
     def __init__(self, stream):
         self.stream = stream
@@ -170,7 +183,7 @@ class StreamManager:
         self.ffmpeg_process = None
     
     def authenticate_youtube(self) -> bool:
-        """Authenticate with YouTube API"""
+        """Authenticate with YouTube API + token refresh"""
         try:
             yt_account = self.stream.youtube_account
             credentials = Credentials(
@@ -180,6 +193,21 @@ class StreamManager:
                 client_id=settings.GOOGLE_CLIENT_ID,
                 client_secret=settings.GOOGLE_CLIENT_SECRET
             )
+            
+            # CRITICAL: Refresh token if expired
+            if credentials.expired and credentials.refresh_token:
+                try:
+                    request = Request()
+                    credentials.refresh(request)
+                    # Save refreshed token
+                    yt_account.access_token = credentials.token
+                    yt_account.token_expiry = credentials.expiry
+                    yt_account.save()
+                    logger.info(f"✅ Token refreshed, valid until {credentials.expiry}")
+                except Exception as e:
+                    logger.error(f"Token refresh failed: {e}")
+                    return False
+            
             self.youtube = build('youtube', 'v3', credentials=credentials)
             logger.info(f"✅ YouTube authenticated for {self.stream.id}")
             return True
@@ -205,17 +233,20 @@ class StreamManager:
                     'selfDeclaredMadeForKids': False
                 },
                 'contentDetails': {
-                    'enableAutoStart': True,
-                    'enableAutoStop': False,
+                    'enableAutoStart': False,  # Changed to False for manual control
+                    'enableAutoStop': True,    # Auto-stop after encoder stops
                     'enableDvr': True,
                     'recordFromStart': True,
                 }
             }
             
-            broadcast = self.youtube.liveBroadcasts().insert(
-                part='snippet,status,contentDetails',
-                body=broadcast_body
-            ).execute()
+            broadcast = self._execute_with_timeout(
+                self.youtube.liveBroadcasts().insert(
+                    part='snippet,status,contentDetails',
+                    body=broadcast_body
+                ),
+                timeout=30
+            )
             
             broadcast_id = broadcast['id']
             logger.info(f"✅ Broadcast created: {broadcast_id}")
@@ -225,28 +256,34 @@ class StreamManager:
                 self._upload_thumbnail(broadcast_id)
             
             # Create stream
-            stream_resp = self.youtube.liveStreams().insert(
-                part='snippet,cdn,status',
-                body={
-                    'snippet': {'title': f"{self.stream.title} - Stream"},
-                    'cdn': {
-                        'frameRate': 'variable',
-                        'ingestionType': 'rtmp',
-                        'resolution': 'variable'
+            stream_resp = self._execute_with_timeout(
+                self.youtube.liveStreams().insert(
+                    part='snippet,cdn,status',
+                    body={
+                        'snippet': {'title': f"{self.stream.title} - Stream"},
+                        'cdn': {
+                            'frameRate': 'variable',
+                            'ingestionType': 'rtmp',
+                            'resolution': 'variable'
+                        }
                     }
-                }
-            ).execute()
+                ),
+                timeout=30
+            )
             
             stream_id = stream_resp['id']
             stream_key = stream_resp['cdn']['ingestionInfo']['streamName']
             ingestion_addr = stream_resp['cdn']['ingestionInfo']['ingestionAddress']
             
             # Bind broadcast to stream
-            self.youtube.liveBroadcasts().bind(
-                part='id,contentDetails',
-                id=broadcast_id,
-                streamId=stream_id
-            ).execute()
+            self._execute_with_timeout(
+                self.youtube.liveBroadcasts().bind(
+                    part='id,contentDetails',
+                    id=broadcast_id,
+                    streamId=stream_id
+                ),
+                timeout=30
+            )
             
             # Save to DB
             self.stream.broadcast_id = broadcast_id
@@ -261,30 +298,57 @@ class StreamManager:
             self._set_error(str(e))
             return None
     
-    def _upload_thumbnail(self, broadcast_id):
-        """Upload thumbnail to YouTube"""
+    def _execute_with_timeout(self, request, timeout=30):
+        """Execute YouTube API request with timeout"""
         try:
-            thumb_url = self.stream.thumbnail.url
-            if not thumb_url.startswith('http'):
-                thumb_url = f"https://{settings.AWS_S3_CUSTOM_DOMAIN}{thumb_url}"
-            
-            resp = requests.get(thumb_url, timeout=30)
-            resp.raise_for_status()
-            
-            media = MediaIoBaseUpload(
-                io.BytesIO(resp.content),
-                mimetype='image/jpeg',
-                resumable=True
-            )
-            
-            self.youtube.thumbnails().set(
-                videoId=broadcast_id,
-                media_body=media
-            ).execute()
-            
-            logger.info("✅ Thumbnail uploaded")
+            request.http.timeout = timeout
+            return request.execute()
+        except HttpError as e:
+            logger.error(f"YouTube API error: {e.resp.status} - {e.content}")
+            raise
         except Exception as e:
-            logger.warning(f"Thumbnail upload failed (non-critical): {e}")
+            logger.error(f"API request timeout or error: {e}")
+            raise
+    
+    def _upload_thumbnail(self, broadcast_id):
+        """Upload thumbnail to YouTube with retry"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                thumb_url = self.stream.thumbnail.url
+                if not thumb_url.startswith('http'):
+                    thumb_url = f"https://{settings.AWS_S3_CUSTOM_DOMAIN}{thumb_url}"
+                
+                resp = requests.get(thumb_url, timeout=30)
+                resp.raise_for_status()
+                
+                media = MediaIoBaseUpload(
+                    io.BytesIO(resp.content),
+                    mimetype='image/jpeg',
+                    resumable=True
+                )
+                
+                self._execute_with_timeout(
+                    self.youtube.thumbnails().set(
+                        videoId=broadcast_id,
+                        media_body=media
+                    ),
+                    timeout=30
+                )
+                
+                logger.info("✅ Thumbnail uploaded")
+                return True
+                
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    logger.warning(f"Thumbnail upload attempt {attempt+1} failed, retrying in {wait}s...")
+                    time.sleep(wait)
+                else:
+                    logger.error(f"Thumbnail upload failed after {max_retries} attempts: {e}")
+                    return False
+        
+        return False
     
     def start_ffmpeg_stream(self):
         """Start FFmpeg streaming - MAIN METHOD"""
@@ -315,6 +379,7 @@ class StreamManager:
             
             # Step 6: Update database
             self.stream.process_id = self.ffmpeg_process.pid
+            self.stream.process_started_at = datetime.now()
             self.stream.status = 'running'
             self.stream.started_at = datetime.now()
             self.stream.save()
@@ -344,7 +409,7 @@ class StreamManager:
             '-safe', '0',
             '-i', concat_path,
             
-            # Video encoding - balanced for YouTube
+            # Video encoding
             '-c:v', 'libx264',
             '-preset', 'veryfast',
             '-profile:v', 'main',
@@ -383,6 +448,7 @@ class StreamManager:
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE,  # CRITICAL: Allow stdin for graceful shutdown
                 preexec_fn=os.setsid,
                 universal_newlines=True,
                 bufsize=1
@@ -424,12 +490,29 @@ class StreamManager:
         """Monitor FFmpeg and auto-restart on failure"""
         restarts = 0
         current_proc = self.ffmpeg_process
+        start_time = time.time()
+        max_uptime_seconds = 168 * 3600  # 1 week
         
         while restarts < MAX_STREAM_RESTARTS:
-            ret = current_proc.wait()
+            # Heartbeat: refresh cache every minute
+            StreamCache.set_process_info(self.stream.id, current_proc.pid, 'running')
+            self.stream.last_heartbeat = datetime.now()
+            self.stream.save()
+            
+            try:
+                ret = current_proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                continue  # Continue monitoring
+            
             logger.warning(f"FFmpeg exited (code={ret}), restart #{restarts}")
             
-            if ret == 0:  # Clean exit
+            # Graceful restart after uptime threshold
+            if time.time() - start_time > max_uptime_seconds:
+                logger.warning("Stream reached max uptime, restarting...")
+                start_time = time.time()
+                restarts = 0
+            
+            if ret == 0 or ret == 143:  # Normal exit or SIGTERM
                 break
             
             restarts += 1
@@ -440,6 +523,7 @@ class StreamManager:
             try:
                 current_proc = self._spawn_ffmpeg(cmd)
                 self.stream.process_id = current_proc.pid
+                self.stream.process_started_at = datetime.now()
                 self.stream.status = 'running'
                 self.stream.save()
                 
@@ -457,12 +541,14 @@ class StreamManager:
         """Clean up after stream ends"""
         try:
             self.stream.process_id = None
+            self.stream.process_started_at = None
+            self.stream.last_heartbeat = None
             self.stream.status = 'error' if restarts >= MAX_STREAM_RESTARTS else 'stopped'
             self.stream.error_message = f'FFmpeg failed after {restarts} restarts'
             self.stream.stopped_at = datetime.now()
             self.stream.save()
             
-            cache.delete(StreamCache.get_stream_key(self.stream.id))
+            StreamCache.delete_process_info(self.stream.id)
             self._cleanup_temp_files()
             
             logger.info(f"Stream {self.stream.id} finalized")
@@ -486,43 +572,92 @@ class StreamManager:
         self.stream.save()
     
     def stop_stream(self) -> bool:
-        """Stop stream gracefully"""
+        """🎬 GRACEFUL SHUTDOWN - Stop stream properly"""
         try:
-            # Kill FFmpeg
-            if self.stream.process_id:
-                try:
-                    os.killpg(os.getpgid(self.stream.process_id), signal.SIGTERM)
-                    time.sleep(2)
-                    os.killpg(os.getpgid(self.stream.process_id), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            logger.info(f"⏹️ Stopping stream {self.stream.id} gracefully...")
             
-            # End YouTube broadcast
-            if self.youtube and self.stream.broadcast_id:
-                try:
-                    self.youtube.liveBroadcasts().transition(
-                        broadcastStatus='complete',
-                        id=self.stream.broadcast_id,
-                        part='status'
-                    ).execute()
-                except Exception as e:
-                    logger.warning(f"YouTube broadcast end failed: {e}")
+            # STEP 1: End YouTube broadcast FIRST (prevents buffering)
+            if self.stream.broadcast_id:
+                success = self._end_youtube_broadcast()
+                if not success:
+                    logger.error("Failed to end YouTube broadcast, force stopping anyway")
             
-            # Update database
+            # STEP 2: Gracefully stop FFmpeg (write 'q' to stdin)
+            if self.ffmpeg_process and self.ffmpeg_process.poll() is None:
+                self._graceful_ffmpeg_stop()
+            
+            # STEP 3: Wait for process to exit
+            if self.ffmpeg_process:
+                try:
+                    self.ffmpeg_process.wait(timeout=GRACEFUL_SHUTDOWN_TIMEOUT)
+                    logger.info("FFmpeg exited gracefully")
+                except subprocess.TimeoutExpired:
+                    logger.warning("FFmpeg didn't exit gracefully, force killing...")
+                    os.killpg(os.getpgid(self.ffmpeg_process.pid), signal.SIGKILL)
+            
+            # STEP 4: Update database
             self.stream.status = 'stopped'
             self.stream.stopped_at = datetime.now()
             self.stream.process_id = None
+            self.stream.process_started_at = None
+            self.stream.last_heartbeat = None
             self.stream.save()
             
             # Cleanup
+            StreamCache.delete_process_info(self.stream.id)
             self._cleanup_temp_files()
             
-            logger.info(f"Stream {self.stream.id} stopped")
+            logger.info(f"✅ Stream {self.stream.id} stopped successfully")
             return True
             
         except Exception as e:
-            logger.error(f"Stop failed: {e}")
+            logger.error(f"❌ Stop failed: {e}", exc_info=True)
             return False
+    
+    def _end_youtube_broadcast(self) -> bool:
+        """🎥 END YOUTUBE BROADCAST - This prevents buffering"""
+        try:
+            if not self.youtube and not self.authenticate_youtube():
+                return False
+            
+            logger.info(f"Ending YouTube broadcast {self.stream.broadcast_id}...")
+            
+            # Transition broadcast to complete
+            self._execute_with_timeout(
+                self.youtube.liveBroadcasts().transition(
+                    broadcastStatus='complete',
+                    id=self.stream.broadcast_id,
+                    part='status'
+                ),
+                timeout=BROADCAST_END_TIMEOUT
+            )
+            
+            logger.info("✅ YouTube broadcast ended")
+            return True
+            
+        except HttpError as e:
+            if e.resp.status == 403:
+                logger.warning("Broadcast already ended or permission denied")
+                return True  # Not critical
+            else:
+                logger.error(f"YouTube API error: {e}")
+                return False
+        except Exception as e:
+            logger.error(f"Failed to end broadcast: {e}")
+            return False
+    
+    def _graceful_ffmpeg_stop(self):
+        """💤 Gracefully stop FFmpeg by sending 'q' to stdin"""
+        try:
+            if self.ffmpeg_process and self.ffmpeg_process.stdin:
+                logger.info("Sending graceful stop command to FFmpeg...")
+                self.ffmpeg_process.stdin.write('q\n')
+                self.ffmpeg_process.stdin.flush()
+                logger.info("Graceful stop command sent")
+            else:
+                logger.warning("Cannot send graceful stop, stdin not available")
+        except Exception as e:
+            logger.warning(f"Graceful stop failed: {e}")
 
 
 # ============ CELERY TASKS ============
@@ -563,3 +698,34 @@ def stop_stream_task(stream_id: int):
     except Exception as e:
         logger.error(f"Stop task failed: {e}")
         return False
+
+
+@shared_task
+def cleanup_orphaned_broadcasts():
+    """Cleanup broadcasts that are stuck in live state"""
+    try:
+        Stream = apps.get_model('streaming', 'Stream')
+        YouTubeAccount = apps.get_model('accounts', 'YouTubeAccount')
+        
+        # Find streams that crashed but didn't end YouTube broadcast
+        stuck_streams = Stream.objects.filter(
+            status__in=['error', 'stopped'],
+            broadcast_id__isnull=False
+        ).exclude(broadcast_id='')
+        
+        for stream in stuck_streams:
+            try:
+                manager = StreamManager(stream)
+                if not manager.authenticate_youtube():
+                    continue
+                
+                # Try to end broadcast
+                manager._end_youtube_broadcast()
+                stream.broadcast_id = ''
+                stream.save()
+                logger.info(f"Cleaned up broadcast for stream {stream.id}")
+            except Exception as e:
+                logger.warning(f"Cleanup failed for stream {stream.id}: {e}")
+    
+    except Exception as e:
+        logger.error(f"Cleanup task failed: {e}")
