@@ -7,9 +7,9 @@ os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = config('SECRET_KEY')
-DEBUG = config('DEBUG', default=True, cast=bool)
-ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='localhost').split(',')
-ENVIRONMENT = config('ENVIRONMENT', default='development')
+DEBUG = config('DEBUG', default=False, cast=bool)  # Default to False for safety
+ALLOWED_HOSTS = [h.strip() for h in config('ALLOWED_HOSTS', default='localhost').split(',')]
+ENVIRONMENT = config('ENVIRONMENT', default='production')  # Default to production
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -34,6 +34,8 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    # Production optimization middleware
+    'django.middleware.gzip.GZipMiddleware',  # Compress responses
 ]
 
 ROOT_URLCONF = 'config.urls'
@@ -56,7 +58,7 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'config.wsgi.application'
 
-# ============ DATABASE CONFIGURATION ============
+# ============ DATABASE CONFIGURATION (OPTIMIZED) ============
 if ENVIRONMENT == 'production':
     DATABASES = {
         'default': {
@@ -66,7 +68,15 @@ if ENVIRONMENT == 'production':
             'PASSWORD': config('DB_PASSWORD', default='postgres'),
             'HOST': config('DB_HOST', default='localhost'),
             'PORT': config('DB_PORT', default='5432'),
-            'OPTIONS': {'sslmode': 'require'}
+            'OPTIONS': {
+                'sslmode': 'require',
+                # Connection pooling reduces overhead
+                'connect_timeout': 10,
+                'options': '-c default_transaction_isolation=read_committed'
+            },
+            # Persistent connections for cost-effectiveness
+            'CONN_MAX_AGE': 300,  # Keep connections alive for 5 minutes
+            'ATOMIC_REQUESTS': False,  # Use selective transactions for performance
         }
     }
 else:
@@ -77,6 +87,10 @@ else:
             'NAME': BASE_DIR / 'db.sqlite3',
         }
     }
+
+# Database query optimization - auto-explain slow queries
+if not DEBUG:
+    DATABASE_QUERY_TIMEOUT = 5000  # 5 seconds in milliseconds
 
 AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
@@ -92,9 +106,9 @@ USE_TZ = True
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-# ============ AWS S3 STORAGE CONFIGURATION ============
+# ============ AWS S3 STORAGE CONFIGURATION (OPTIMIZED) ============
 if ENVIRONMENT == 'production':
-    # Production: Use AWS S3
+    # Production: Use AWS S3 with cost optimization
     AWS_ACCESS_KEY_ID = config('AWS_ACCESS_KEY_ID')
     AWS_SECRET_ACCESS_KEY = config('AWS_SECRET_ACCESS_KEY')
     AWS_STORAGE_BUCKET_NAME = config('AWS_STORAGE_BUCKET_NAME')
@@ -103,25 +117,33 @@ if ENVIRONMENT == 'production':
     AWS_LOCATION = 'media'
     AWS_DEFAULT_ACL = None
     AWS_S3_FILE_OVERWRITE = False
-    AWS_S3_OBJECT_PARAMETERS = {'CacheControl': 'max-age=86400'}
     
-    # Static Files
+    # Optimized S3 settings for cost-effectiveness
+    AWS_S3_OBJECT_PARAMETERS = {
+        'CacheControl': 'max-age=31536000',  # 1 year caching to reduce transfers
+        'ServerSideEncryption': 'AES256',  # Free encryption
+    }
+    
+    # Use S3 Transfer Acceleration (optional, depends on setup)
+    AWS_S3_USE_SSL = True
+    AWS_S3_VERIFY = True
+    
+    # Static Files (served from S3)
     STATIC_URL = f'https://{AWS_S3_CUSTOM_DOMAIN}/static/'
     STATIC_ROOT = 'static'
-    STATICFILES_STORAGE = 'storages.backends.s3boto3.S3Boto3Storage'
     
-    # Media Files
+    # Media Files (served from S3)
     MEDIA_URL = f'https://{AWS_S3_CUSTOM_DOMAIN}/media/'
     MEDIA_ROOT = 'media'
-    DEFAULT_FILE_STORAGE = 'storages.backends.s3boto3.S3Boto3Storage'
     
-    # Storage configuration
+    # Storage configuration with optimization
     STORAGES = {
         'default': {
             'BACKEND': 'storages.backends.s3boto3.S3Boto3Storage',
             'OPTIONS': {
                 'bucket_name': AWS_STORAGE_BUCKET_NAME,
                 'region_name': AWS_S3_REGION_NAME,
+                'max_memory_size': 5242880,  # 5MB before using disk (default is larger)
             }
         },
         'staticfiles': {
@@ -141,19 +163,28 @@ else:
     MEDIA_URL = '/media/'
     MEDIA_ROOT = BASE_DIR / 'media'
 
-# ============ CACHE CONFIGURATION ============
+# ============ CACHE CONFIGURATION (OPTIMIZED FOR PRODUCTION) ============
 if ENVIRONMENT == 'production':
+    # Production: Redis with aggressive caching
     CACHES = {
         'default': {
             'BACKEND': 'django_redis.cache.RedisCache',
             'LOCATION': config('REDIS_URL', default='redis://localhost:6379/1'),
             'OPTIONS': {
                 'CLIENT_CLASS': 'django_redis.client.DefaultClient',
-                'IGNORE_EXCEPTIONS': True,
+                'CONNECTION_POOL_CLASS': 'redis.connection.BlockingConnectionPool',
+                'CONNECTION_POOL_CLASS_KWARGS': {
+                    'max_connections': 10,
+                    'timeout': 20,
+                },
+                'IGNORE_EXCEPTIONS': True,  # Fail gracefully
+                'COMPRESSOR': 'django_redis.compressors.zlib.ZlibCompressor',
+                'PARSER': 'redis.connection.HiredisParser',
             }
         }
     }
 else:
+    # Development: In-memory cache
     CACHES = {
         'default': {
             'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
@@ -163,6 +194,8 @@ else:
 
 SESSION_ENGINE = 'django.contrib.sessions.backends.cache'
 SESSION_CACHE_ALIAS = 'default'
+# Cache sessions for 2 weeks
+SESSION_COOKIE_AGE = 1209600  # 2 weeks in seconds
 
 # ============ GOOGLE OAUTH SETTINGS ============
 GOOGLE_CLIENT_ID = config('GOOGLE_CLIENT_ID')

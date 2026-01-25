@@ -37,13 +37,35 @@ class Stream(models.Model):
         ('error', 'Error'),
     ]
 
+    STREAM_SOURCE_CHOICES = [
+        ('media_files', 'Media Files'),
+        ('playlist', 'YouTube Playlist'),
+        ('playlist_direct', 'YouTube Playlist (Direct Stream)'),
+    ]
+
+    PLAYLIST_SERVE_MODE_CHOICES = [
+        ('download', 'Download Videos'),
+        ('direct', 'Direct Stream (No Download)'),
+    ]
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='streams')
     youtube_account = models.ForeignKey(YouTubeAccount, on_delete=models.CASCADE, related_name='streams')
     title = models.CharField(max_length=255)
     description = models.TextField(blank=True)
-    thumbnail = models.ImageField(upload_to='uploads/stream_thumbnails/', blank=True, null=True)  # NEW FIELD
-    media_files = models.ManyToManyField(MediaFile, related_name='streams')
+    thumbnail = models.ImageField(upload_to='uploads/stream_thumbnails/', blank=True, null=True)
+    media_files = models.ManyToManyField(MediaFile, related_name='streams', blank=True)
+    # NEW FIELDS FOR PLAYLIST STREAMING
+    stream_source = models.CharField(max_length=20, choices=STREAM_SOURCE_CHOICES, default='media_files')
+    playlist_id = models.CharField(max_length=255, blank=True)  # YouTube playlist ID
+    playlist_title = models.CharField(max_length=255, blank=True)  # Cached playlist title
+    shuffle_playlist = models.BooleanField(default=False)  # Shuffle playlist items
+    playlist_serve_mode = models.CharField(
+        max_length=20,
+        choices=PLAYLIST_SERVE_MODE_CHOICES,
+        default='download',
+        help_text='How to serve playlist videos: download or direct stream'
+    )
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='idle')
     stream_key = models.CharField(max_length=255, blank=True)
     broadcast_id = models.CharField(max_length=255, blank=True)

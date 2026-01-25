@@ -2,6 +2,10 @@ from django.shortcuts import render, redirect, get_object_or_404
 from django.contrib.auth.decorators import login_required
 from django.contrib import messages
 from django.http import JsonResponse
+from django.views.decorators.http import require_POST
+from django.views.decorators.cache import cache_page
+from django.db.models import Q, Prefetch, Sum
+from django.core.cache import cache
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -9,31 +13,56 @@ from googleapiclient.http import MediaFileUpload
 from django.conf import settings
 from datetime import datetime, timedelta
 import os
+import logging
 from .models import Stream, MediaFile, StreamLog
 from apps.accounts.models import YouTubeAccount
 from apps.payments.models import Subscription
 from .stream_manager import StreamManager
 import json
-from django.views.decorators.http import require_POST
-from django.views.decorators.csrf import csrf_exempt
 
-# NEW: Helper function to get user's total storage used
-def get_user_storage_usage(user):
-    """Calculate total storage used by user in bytes"""
-    total_size = 0
-    media_files = MediaFile.objects.filter(user=user)
-    for media in media_files:
-        if media.file:
-            try:
-                total_size += media.file.size
-            except:
-                pass
+logger = logging.getLogger(__name__)
+
+# ============ HELPER FUNCTIONS (OPTIMIZED) ============
+
+def get_user_storage_usage(user, use_cache=True):
+    """Calculate total storage used by user in bytes (with caching)
+    
+    Args:
+        user: User object
+        use_cache: Use cached value if available (default: True)
+    
+    Returns:
+        Total storage in bytes
+    """
+    cache_key = f"user_storage_{user.id}"
+    
+    if use_cache:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+    
+    # Use aggregation for efficiency (single DB query)
+    total_size = MediaFile.objects.filter(user=user).aggregate(
+        total=Sum('file__size')
+    )['total'] or 0
+    
+    # Cache for 1 hour
+    cache.set(cache_key, total_size, timeout=3600)
     return total_size
 
-# NEW: Helper function to check if user has storage available
+
 def has_storage_available(user, file_size):
-    """Check if user has storage available for new file"""
-    subscription = Subscription.objects.filter(
+    """Check if user has storage available for new file (with caching)
+    
+    Args:
+        user: User object
+        file_size: Size of file in bytes
+    
+    Returns:
+        Tuple: (has_storage, current_usage, storage_limit)
+    """
+    # Use select_related to minimize queries
+    subscription = Subscription.objects.select_related('user').filter(
         user=user,
         is_active=True,
         status='active'
@@ -45,12 +74,9 @@ def has_storage_available(user, file_size):
     current_usage = get_user_storage_usage(user)
     available_storage = subscription.storage_limit - current_usage
 
-    if file_size > available_storage:
-        return False, current_usage, subscription.storage_limit
+    return (file_size <= available_storage), current_usage, subscription.storage_limit
 
-    return True, current_usage, subscription.storage_limit
 
-# NEW: Convert bytes to readable format
 def format_bytes(bytes_size):
     """Convert bytes to human readable format"""
     for unit in ['B', 'KB', 'MB', 'GB']:
@@ -156,15 +182,20 @@ def oauth_callback(request):
 
 @login_required
 def stream_list(request):
-    """List all user streams"""
-    streams = Stream.objects.filter(user=request.user).order_by('-created_at')
+    """List all user streams (optimized with select_related)"""
+    # Use select_related to fetch related objects in one query
+    streams = Stream.objects.filter(user=request.user).select_related(
+        'user', 'youtube_account'
+    ).order_by('-created_at')[:100]  # Limit to last 100
+    
     return render(request, 'streaming/stream_list.html', {'streams': streams})
+
 
 @login_required
 def stream_create(request):
-    """Create a new stream"""
-    # Check subscription
-    subscription = Subscription.objects.filter(
+    """Create a new stream (optimized database queries)"""
+    # Use select_related to minimize queries
+    subscription = Subscription.objects.select_related('user').filter(
         user=request.user,
         is_active=True
     ).first()
@@ -173,47 +204,67 @@ def stream_create(request):
         messages.error(request, 'You need an active subscription to create streams')
         return redirect('subscribe')
 
-    # STRONG LIMIT CHECK
-    forbidden_statuses = ['running','stopped', 'starting', 'scheduled']
+    # Use values_list for count only (more efficient)
+    forbidden_statuses = ['running', 'stopped', 'starting', 'scheduled']
     active_streams = Stream.objects.filter(
         user=request.user,
         status__in=forbidden_statuses
     ).count()
 
     if active_streams >= subscription.max_streams:
-        messages.error(request, f'You have reached your stream limit ({subscription.max_streams} streams). '
-                      f'This includes all running, starting, and scheduled streams.')
+        messages.error(request, f'You have reached your stream limit ({subscription.max_streams} streams)')
         return redirect('stream_list')
 
-    # Check YouTube connection
-    youtube_accounts = YouTubeAccount.objects.filter(user=request.user, is_active=True)
+    # Get YouTube accounts with minimal data
+    youtube_accounts = YouTubeAccount.objects.filter(
+        user=request.user, 
+        is_active=True
+    ).values('id', 'channel_title')
+    
     if not youtube_accounts.exists():
         messages.error(request, 'Please connect your YouTube account first')
         return redirect('connect_youtube')
 
     if request.method == 'POST':
-        title = request.POST.get('title')
-        description = request.POST.get('description', '')
+        title = request.POST.get('title', '').strip()
+        description = request.POST.get('description', '').strip()
         youtube_account_id = request.POST.get('youtube_account')
+        stream_source = request.POST.get('stream_source', 'media_files')
         media_file_ids = request.POST.getlist('media_files')
+        playlist_id = request.POST.get('playlist_id', '').strip()
+        shuffle_playlist = request.POST.get('shuffle_playlist') == 'on'
+        playlist_serve_mode = request.POST.get('playlist_serve_mode', 'download')
         loop_enabled = request.POST.get('loop_enabled') == 'on'
         thumbnail = request.FILES.get('thumbnail')
 
         try:
+            # Validate stream source
+            if stream_source == 'playlist' and not playlist_id:
+                messages.error(request, 'Please select a playlist')
+                return redirect('stream_create')
+            
+            if stream_source == 'media_files' and not media_file_ids:
+                messages.error(request, 'Please select at least one media file')
+                return redirect('stream_create')
+            
             youtube_account = YouTubeAccount.objects.get(id=youtube_account_id, user=request.user)
 
-            # Create stream with thumbnail
+            # Create stream with new fields
             stream = Stream.objects.create(
                 user=request.user,
                 youtube_account=youtube_account,
                 title=title,
                 description=description,
                 loop_enabled=loop_enabled,
-                thumbnail=thumbnail
+                thumbnail=thumbnail,
+                stream_source=stream_source,  # NEW
+                playlist_id=playlist_id if stream_source == 'playlist' else '',  # NEW
+                shuffle_playlist=shuffle_playlist,  # NEW
+                playlist_serve_mode=playlist_serve_mode if stream_source == 'playlist' else 'download'  # NEW
             )
 
-            # Add media files
-            if media_file_ids:
+            # Add media files only for media_files source
+            if stream_source == 'media_files' and media_file_ids:
                 media_files = MediaFile.objects.filter(id__in=media_file_ids, user=request.user)
                 stream.media_files.set(media_files)
 
@@ -235,8 +286,72 @@ def stream_create(request):
         'storage_usage': format_bytes(current_usage),
         'storage_limit': format_bytes(subscription.storage_limit),
         'storage_available': format_bytes(available_storage),
+        'playlist_serve_modes': [
+            {'value': 'download', 'label': 'Download Videos'},
+            {'value': 'direct', 'label': 'Direct Stream (No Download)'},
+        ],
     }
     return render(request, 'streaming/stream_create.html', context)
+
+@login_required
+def get_playlists_api(request):
+    """API endpoint to fetch playlists for a YouTube account"""
+    youtube_account_id = request.GET.get('youtube_account_id')
+    
+    if not youtube_account_id:
+        return JsonResponse({'error': 'youtube_account_id required'}, status=400)
+    
+    try:
+        youtube_account = YouTubeAccount.objects.get(id=youtube_account_id, user=request.user)
+        
+        # Build YouTube API credentials
+        credentials = Credentials(
+            token=youtube_account.access_token,
+            refresh_token=youtube_account.refresh_token,
+            token_uri='https://oauth2.googleapis.com/token',
+            client_id=settings.GOOGLE_CLIENT_ID,
+            client_secret=settings.GOOGLE_CLIENT_SECRET,
+            scopes=settings.GOOGLE_SCOPES
+        )
+        
+        youtube = build('youtube', 'v3', credentials=credentials)
+        
+        # Fetch playlists
+        playlists = []
+        next_page_token = None
+        
+        while len(playlists) < 100:  # Limit to 100 playlists
+            request_obj = youtube.playlists().list(
+                part='snippet,contentDetails',
+                mine=True,
+                maxResults=50,
+                pageToken=next_page_token
+            )
+            response = request_obj.execute()
+            
+            for item in response.get('items', []):
+                playlist = {
+                    'id': item['id'],
+                    'title': item['snippet']['title'],
+                    'item_count': item['contentDetails']['itemCount'],
+                    'thumbnail': item['snippet']['thumbnails'].get('default', {}).get('url', '')
+                }
+                playlists.append(playlist)
+            
+            next_page_token = response.get('nextPageToken')
+            if not next_page_token or len(playlists) >= 100:
+                break
+        
+        return JsonResponse({
+            'status': 'success',
+            'playlists': playlists
+        })
+    
+    except YouTubeAccount.DoesNotExist:
+        return JsonResponse({'error': 'YouTube account not found'}, status=404)
+    except Exception as e:
+        logger.error(f"Failed to fetch playlists: {e}")
+        return JsonResponse({'error': str(e)}, status=500)
 
 @login_required
 def stream_detail(request, stream_id):

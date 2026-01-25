@@ -1,37 +1,63 @@
 import subprocess
 import os
 import signal
-import sys
 import time
 import logging
+import logging.handlers
 import requests
-import tempfile
-import threading
 import json
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 from datetime import datetime, timedelta
 from pathlib import Path
+from functools import lru_cache
+from urllib.parse import urlparse
 
 from django.conf import settings
 from django.apps import apps
 from django.core.cache import cache
-from django.db import transaction
+from django.db import transaction, connection
+from django.db.utils import OperationalError
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 from celery import shared_task
-import io
 
+# ============ LOGGING CONFIGURATION (optimized for production) ============
 logger = logging.getLogger(__name__)
+if not logger.handlers:
+    # Use rotating file handler to prevent disk filling
+    # For development, use a writable location; for production, configure STREAM_LOG_FILE
+    log_file = getattr(settings, 'STREAM_LOG_FILE', './logs/stream.log')
+    log_path = Path(log_file)
+    
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except (PermissionError, OSError):
+        # Fallback to current directory if /var/log is not writable
+        log_file = './logs/stream.log'
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    handler = logging.handlers.RotatingFileHandler(
+        filename=log_file,
+        maxBytes=10 * 1024 * 1024,  # 10MB per file
+        backupCount=5
+    )
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    ))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
-# ============ CONFIGURATION ============
+# ============ CONFIGURATION (cost-optimized defaults) ============
 TEMP_DIR = getattr(settings, 'STREAM_TEMP_DIR', '/var/tmp/streams')
-MAX_CONCURRENT_DOWNLOADS = getattr(settings, 'MAX_CONCURRENT_DOWNLOADS', 3)
-CHUNK_SIZE = 512 * 1024  # 512KB optimal for S3
-STREAM_BUFFER_SIZE = '50M'
-FFMPEG_TIMEOUT = 300  # 5min per operation
-MAX_STREAM_RESTARTS = 5
-CELERY_TASK_TIMEOUT = 86400  # 24 hours
+MAX_CONCURRENT_DOWNLOADS = getattr(settings, 'MAX_CONCURRENT_DOWNLOADS', 2)  # Reduced from 3
+CHUNK_SIZE = getattr(settings, 'STREAM_CHUNK_SIZE', 256 * 1024)  # Reduced to 256KB for better memory
+STREAM_BUFFER_SIZE = getattr(settings, 'STREAM_BUFFER_SIZE', '15M')  # Reduced from 50M for cost
+FFMPEG_TIMEOUT = getattr(settings, 'FFMPEG_TIMEOUT', 300)
+MAX_STREAM_RESTARTS = getattr(settings, 'MAX_STREAM_RESTARTS', 3)  # Reduced from 5
+CELERY_TASK_TIMEOUT = getattr(settings, 'CELERY_TASK_TIMEOUT', 3600)  # 1hr, reduced from 24h
+STREAM_CLEANUP_INTERVAL = getattr(settings, 'STREAM_CLEANUP_INTERVAL', 300)  # Cleanup every 5min
+PROCESS_INFO_CACHE_TTL = 3600  # 1 hour, reduced from 24h
 
 # Ensure temp directory exists
 Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
@@ -40,25 +66,42 @@ Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
 # ============ UTILITIES ============
 
 class StreamCache:
-    """Redis-backed cache for stream metadata"""
+    """Redis-backed cache for stream metadata with TTL optimization"""
+    
+    CACHE_TTL = PROCESS_INFO_CACHE_TTL  # Use configured TTL
+    KEY_PREFIX = "stream:"
     
     @staticmethod
+    @lru_cache(maxsize=128)  # Local LRU cache for key generation
     def get_stream_key(stream_id):
-        return f"stream:{stream_id}"
+        """Get cache key with local caching"""
+        return f"{StreamCache.KEY_PREFIX}{stream_id}"
     
     @staticmethod
-    def set_process_info(stream_id, pid, status):
-        """Store process info in cache"""
-        cache.set(
-            StreamCache.get_stream_key(stream_id),
-            {'pid': pid, 'status': status, 'started': datetime.now().isoformat()},
-            timeout=86400
-        )
+    def set_process_info(stream_id: int, pid: int, status: str) -> None:
+        """Store process info in cache with TTL"""
+        try:
+            cache.set(
+                StreamCache.get_stream_key(stream_id),
+                {
+                    'pid': pid,
+                    'status': status,
+                    'started': datetime.now().isoformat()
+                },
+                timeout=StreamCache.CACHE_TTL
+            )
+        except Exception as e:
+            # Fail gracefully - logging only
+            logger.warning(f"Cache set failed for stream {stream_id}: {e}")
     
     @staticmethod
-    def get_process_info(stream_id):
-        """Retrieve cached process info"""
-        return cache.get(StreamCache.get_stream_key(stream_id)) or {}
+    def get_process_info(stream_id: int) -> Dict:
+        """Retrieve cached process info with fallback"""
+        try:
+            return cache.get(StreamCache.get_stream_key(stream_id)) or {}
+        except Exception as e:
+            logger.warning(f"Cache get failed for stream {stream_id}: {e}")
+            return {}
 
 
 def get_temp_dir_for_stream(stream_id):
@@ -68,18 +111,32 @@ def get_temp_dir_for_stream(stream_id):
     return stream_dir
 
 
-def download_s3_file_chunked(media_file, stream_id):
-    """Download S3 file with progress tracking"""
+def download_s3_file_chunked(media_file, stream_id: int, timeout: int = FFMPEG_TIMEOUT) -> Optional[str]:
+    """Download S3 file with optimized chunking and connection pooling
+    
+    Args:
+        media_file: MediaFile object to download
+        stream_id: Stream ID for organizing temp files
+        timeout: Request timeout in seconds
+    
+    Returns:
+        Path to downloaded file or None if failed
+    """
     url = media_file.file.url
     stream_dir = get_temp_dir_for_stream(stream_id)
     temp_path = os.path.join(stream_dir, f"media_{media_file.id}.mp4")
     
     try:
-        resp = requests.get(url, stream=True, timeout=FFMPEG_TIMEOUT)
+        # Use session for connection pooling (more efficient than individual requests)
+        session = requests.Session()
+        session.headers.update({'Connection': 'keep-alive'})
+        
+        resp = session.get(url, stream=True, timeout=timeout)
         resp.raise_for_status()
         
         total_size = int(resp.headers.get('content-length', 0))
         downloaded = 0
+        last_log_time = time.time()
         
         with open(temp_path, 'wb') as f:
             for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
@@ -87,18 +144,40 @@ def download_s3_file_chunked(media_file, stream_id):
                     f.write(chunk)
                     downloaded += len(chunk)
                     
-                    if total_size:
-                        progress = (downloaded / total_size) * 100
-                        logger.debug(f"Downloaded {media_file.title}: {progress:.1f}%")
+                    # Log progress every 5 seconds (reduces I/O overhead)
+                    if time.time() - last_log_time > 5:
+                        if total_size:
+                            progress = (downloaded / total_size) * 100
+                            logger.debug(f"Download {media_file.title}: {progress:.1f}%")
+                        last_log_time = time.time()
         
-        logger.info(f"✅ Downloaded {media_file.title} ({total_size / (1024**2):.1f}MB)")
+        file_size_mb = total_size / (1024 * 1024) if total_size else 0
+        logger.info(f"Downloaded {media_file.title} ({file_size_mb:.1f}MB)")
         return temp_path
         
+    except requests.exceptions.Timeout:
+        logger.error(f"Download timeout for {media_file.title}")
+        _safe_remove_file(temp_path)
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Download failed for {media_file.title}: {e}")
+        _safe_remove_file(temp_path)
+        return None
     except Exception as e:
-        logger.error(f"Failed to download {media_file.title}: {e}")
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        raise
+        logger.error(f"Unexpected error downloading {media_file.title}: {e}")
+        _safe_remove_file(temp_path)
+        return None
+    finally:
+        session.close()
+
+
+def _safe_remove_file(file_path: str) -> None:
+    """Safely remove file without raising exception"""
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    except OSError as e:
+        logger.warning(f"Failed to remove {file_path}: {e}")
 
 
 def download_files_parallel(media_files, stream_id):
@@ -289,6 +368,24 @@ class StreamManager:
     def start_ffmpeg_stream(self):
         """Start FFmpeg streaming - MAIN METHOD"""
         try:
+            # Check stream source type
+            if self.stream.stream_source == 'playlist':
+                # Check if direct serve mode is enabled
+                if hasattr(self.stream, 'playlist_serve_mode') and self.stream.playlist_serve_mode == 'direct':
+                    return self._start_playlist_direct_stream()
+                else:
+                    return self._start_playlist_stream()
+            else:
+                return self._start_media_files_stream()
+        except Exception as e:
+            logger.error(f"❌ Stream start failed: {e}", exc_info=True)
+            self._set_error(str(e))
+            self._cleanup_temp_files()
+            return None
+    
+    def _start_media_files_stream(self):
+        """Start streaming from uploaded media files"""
+        try:
             media_files = list(self.stream.media_files.all())
             if not media_files:
                 raise Exception("No media files attached")
@@ -326,10 +423,334 @@ class StreamManager:
             return self.ffmpeg_process.pid
             
         except Exception as e:
-            logger.error(f"❌ Stream start failed: {e}", exc_info=True)
+            logger.error(f"❌ Media files stream start failed: {e}", exc_info=True)
             self._set_error(str(e))
             self._cleanup_temp_files()
             return None
+    
+    def _start_playlist_stream(self):
+        """Start streaming from YouTube playlist"""
+        try:
+            if not self.stream.playlist_id:
+                raise Exception("No playlist selected")
+            
+            logger.info(f"🚀 Starting playlist stream {self.stream.id} from playlist {self.stream.playlist_id}")
+            
+            # Step 1: Download playlist videos
+            logger.info("⬇️ Downloading playlist videos...")
+            file_paths = self._download_playlist_videos()
+            
+            if not file_paths:
+                raise Exception("Failed to download any videos from playlist")
+            
+            logger.info(f"✅ Downloaded {len(file_paths)} videos from playlist")
+            
+            # Step 2: Create concat file for playlist videos
+            concat_path = self._create_playlist_concat_file(file_paths, loops=50)
+            logger.info(f"✅ Concat file created: {concat_path}")
+            
+            # Step 3: Build FFmpeg command
+            ffmpeg_cmd = self._build_ffmpeg_command(concat_path)
+            
+            # Step 4: Start FFmpeg
+            self.ffmpeg_process = self._spawn_ffmpeg(ffmpeg_cmd)
+            
+            # Step 5: Start monitoring thread
+            self._start_monitor_thread(ffmpeg_cmd)
+            
+            # Step 6: Update database
+            self.stream.process_id = self.ffmpeg_process.pid
+            self.stream.status = 'running'
+            self.stream.started_at = datetime.now()
+            self.stream.save()
+            
+            # Cache process info
+            StreamCache.set_process_info(self.stream.id, self.ffmpeg_process.pid, 'running')
+            
+            logger.info(f"✅ Playlist Stream LIVE! PID: {self.ffmpeg_process.pid}")
+            return self.ffmpeg_process.pid
+            
+        except Exception as e:
+            logger.error(f"❌ Playlist stream start failed: {e}", exc_info=True)
+            self._set_error(str(e))
+            self._cleanup_temp_files()
+            return None
+    
+    def _download_playlist_videos(self) -> Dict[int, str]:
+        """Download all videos from YouTube playlist"""
+        try:
+            if not self.youtube and not self.authenticate_youtube():
+                raise Exception("Failed to authenticate with YouTube")
+            
+            video_ids = self._get_playlist_video_ids()
+            
+            if not video_ids:
+                raise Exception("No videos found in playlist")
+            
+            file_paths = {}
+            stream_dir = self.temp_dir
+            
+            # Download videos sequentially to avoid rate limiting
+            for idx, video_id in enumerate(video_ids):
+                try:
+                    logger.info(f"Downloading video {idx + 1}/{len(video_ids)}: {video_id}")
+                    file_path = self._download_youtube_video(video_id, stream_dir, idx)
+                    if file_path:
+                        file_paths[idx] = file_path
+                except Exception as e:
+                    logger.warning(f"Failed to download video {video_id}: {e}")
+                    continue
+            
+            return file_paths
+            
+        except Exception as e:
+            logger.error(f"Failed to download playlist videos: {e}")
+            raise
+    
+    def _get_playlist_video_ids(self) -> list:
+        """Get all video IDs from YouTube playlist"""
+        try:
+            video_ids = []
+            next_page_token = None
+            
+            while True:
+                request = self.youtube.playlistItems().list(
+                    part='contentDetails',
+                    playlistId=self.stream.playlist_id,
+                    maxResults=50,
+                    pageToken=next_page_token
+                )
+                response = request.execute()
+                
+                for item in response.get('items', []):
+                    video_id = item['contentDetails']['videoId']
+                    video_ids.append(video_id)
+                
+                next_page_token = response.get('nextPageToken')
+                if not next_page_token:
+                    break
+            
+            # Shuffle if enabled
+            if self.stream.shuffle_playlist:
+                import random
+                random.shuffle(video_ids)
+            
+            logger.info(f"Found {len(video_ids)} videos in playlist")
+            return video_ids
+            
+        except Exception as e:
+            logger.error(f"Failed to get playlist video IDs: {e}")
+            raise
+    
+    def _download_youtube_video(self, video_id: str, output_dir: str, index: int) -> Optional[str]:
+        """Download a single YouTube video using yt-dlp"""
+        try:
+            import subprocess
+            
+            output_template = os.path.join(output_dir, f'video_{index:03d}.%(ext)s')
+            
+            # Use yt-dlp to download video
+            cmd = [
+                'yt-dlp',
+                '-f', 'best[height<=720]/best',  # Best format up to 720p
+                '-o', output_template,
+                f'https://www.youtube.com/watch?v={video_id}'
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, timeout=300)
+            
+            if result.returncode != 0:
+                logger.error(f"yt-dlp error: {result.stderr.decode()}")
+                return None
+            
+            # Find the downloaded file
+            for ext in ['mp4', 'mkv', 'webm', 'flv']:
+                file_path = output_template.replace('%(ext)s', ext)
+                if os.path.exists(file_path):
+                    logger.info(f"✅ Downloaded: {file_path}")
+                    return file_path
+            
+            logger.warning(f"No video file found for {video_id}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Failed to download video {video_id}: {e}")
+            return None
+    
+    def _create_playlist_concat_file(self, file_paths: Dict[int, str], loops: int = 50) -> str:
+        """Create FFmpeg concat file for playlist videos"""
+        concat_path = os.path.join(self.temp_dir, 'playlist_concat.txt')
+        
+        try:
+            with open(concat_path, 'w') as f:
+                for loop in range(loops):
+                    for idx in sorted(file_paths.keys()):
+                        file_path = file_paths[idx]
+                        f.write(f"file '{file_path}'\n")
+            
+            logger.info(f"Created concat file: {concat_path}")
+            return concat_path
+            
+        except Exception as e:
+            logger.error(f"Failed to create concat file: {e}")
+            raise
+    
+    def _start_playlist_direct_stream(self):
+        """Start streaming directly from YouTube playlist URLs (no download)"""
+        try:
+            if not self.stream.playlist_id:
+                raise Exception("No playlist selected")
+            
+            logger.info(f"🚀 Starting DIRECT playlist stream {self.stream.id} from playlist {self.stream.playlist_id}")
+            
+            # Step 1: Get video URLs from playlist
+            logger.info("🔗 Extracting playlist video URLs...")
+            video_urls = self._get_playlist_video_urls()
+            
+            if not video_urls:
+                raise Exception("Failed to extract any video URLs from playlist")
+            
+            logger.info(f"✅ Extracted {len(video_urls)} video URLs from playlist")
+            
+            # Step 2: Create concat file for direct URLs
+            concat_path = self._create_direct_concat_file(video_urls, loops=50)
+            logger.info(f"✅ Concat file created: {concat_path}")
+            
+            # Step 3: Build FFmpeg command
+            ffmpeg_cmd = self._build_ffmpeg_command(concat_path)
+            
+            # Step 4: Start FFmpeg
+            self.ffmpeg_process = self._spawn_ffmpeg(ffmpeg_cmd)
+            
+            # Step 5: Start monitoring thread
+            self._start_monitor_thread(ffmpeg_cmd)
+            
+            # Step 6: Update database
+            self.stream.process_id = self.ffmpeg_process.pid
+            self.stream.status = 'running'
+            self.stream.started_at = datetime.now()
+            self.stream.save()
+            
+            # Cache process info
+            StreamCache.set_process_info(self.stream.id, self.ffmpeg_process.pid, 'running')
+            
+            logger.info(f"✅ Direct Playlist Stream LIVE! PID: {self.ffmpeg_process.pid}")
+            return self.ffmpeg_process.pid
+            
+        except Exception as e:
+            logger.error(f"❌ Direct playlist stream start failed: {e}", exc_info=True)
+            self._set_error(str(e))
+            self._cleanup_temp_files()
+            return None
+    
+    def _get_playlist_video_urls(self) -> Dict[int, str]:
+        """Extract direct video URLs from YouTube playlist using yt-dlp"""
+        try:
+            import subprocess
+            
+            video_urls = {}
+            
+            # Use yt-dlp to extract video URLs from playlist
+            cmd = [
+                'yt-dlp',
+                '--flat-playlist',
+                '--print', '%(id)s',
+                f'https://www.youtube.com/playlist?list={self.stream.playlist_id}'
+            ]
+            
+            logger.info(f"Extracting videos from playlist {self.stream.playlist_id}...")
+            result = subprocess.run(cmd, capture_output=True, timeout=60)
+            
+            if result.returncode != 0:
+                logger.error(f"yt-dlp error: {result.stderr.decode()}")
+                raise Exception("Failed to extract playlist videos")
+            
+            video_ids = result.stdout.decode().strip().split('\n')
+            video_ids = [vid for vid in video_ids if vid.strip()]
+            
+            if not video_ids:
+                raise Exception("No videos found in playlist")
+            
+            logger.info(f"Found {len(video_ids)} videos in playlist")
+            
+            # Shuffle if enabled
+            if self.stream.shuffle_playlist:
+                import random
+                random.shuffle(video_ids)
+            
+            # Extract direct streaming URL for each video
+            for idx, video_id in enumerate(video_ids):
+                try:
+                    url = self._get_direct_video_url(video_id)
+                    if url:
+                        video_urls[idx] = url
+                        logger.info(f"✅ Video {idx + 1}/{len(video_ids)}: {video_id} -> URL extracted")
+                    else:
+                        logger.warning(f"Failed to extract URL for video {idx + 1}: {video_id}")
+                except Exception as e:
+                    logger.warning(f"Error extracting URL for video {idx + 1}: {e}")
+                    continue
+            
+            if not video_urls:
+                raise Exception("Failed to extract any valid video URLs")
+            
+            logger.info(f"✅ Successfully extracted {len(video_urls)} direct video URLs")
+            return video_urls
+            
+        except Exception as e:
+            logger.error(f"Failed to get playlist video URLs: {e}")
+            raise
+    
+    def _get_direct_video_url(self, video_id: str) -> Optional[str]:
+        """Get direct streaming URL for a single YouTube video using yt-dlp"""
+        try:
+            import subprocess
+            
+            # Use yt-dlp to extract direct streaming URL
+            cmd = [
+                'yt-dlp',
+                '-f', 'best[height<=720]/best',  # Best format up to 720p
+                '--print', '%(url)s',
+                '-g',  # Get URL only (don't download)
+                f'https://www.youtube.com/watch?v={video_id}'
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, timeout=30)
+            
+            if result.returncode != 0:
+                logger.error(f"Failed to get URL for {video_id}: {result.stderr.decode()}")
+                return None
+            
+            url = result.stdout.decode().strip()
+            if url and url.startswith('http'):
+                logger.debug(f"Got direct URL for {video_id}")
+                return url
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Failed to get direct URL for {video_id}: {e}")
+            return None
+    
+    def _create_direct_concat_file(self, video_urls: Dict[int, str], loops: int = 50) -> str:
+        """Create FFmpeg concat file for direct video URLs"""
+        concat_path = os.path.join(self.temp_dir, 'direct_playlist_concat.txt')
+        
+        try:
+            with open(concat_path, 'w') as f:
+                for loop in range(loops):
+                    for idx in sorted(video_urls.keys()):
+                        url = video_urls[idx]
+                        # Escape single quotes in URL
+                        url_escaped = url.replace("'", "'\\''")
+                        f.write(f"file '{url_escaped}'\n")
+            
+            logger.info(f"Created direct concat file: {concat_path}")
+            return concat_path
+            
+        except Exception as e:
+            logger.error(f"Failed to create direct concat file: {e}")
+            raise
     
     def _build_ffmpeg_command(self, concat_path: str) -> list:
         """Build production-grade FFmpeg command"""

@@ -366,6 +366,118 @@
     color: white;
   }
 
+  /* ==================== Stream Source Tabs (NEW) ==================== */
+  .source-tabs {
+    display: flex;
+    gap: 0.75rem;
+    margin-bottom: 1.5rem;
+    border-bottom: 2px solid var(--border-color);
+  }
+
+  .source-tab {
+    padding: 1rem 1.5rem;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    font-weight: 700;
+    color: var(--text-secondary);
+    transition: var(--transition-smooth);
+    border-bottom: 3px solid transparent;
+    margin-bottom: -2px;
+    font-size: 0.95rem;
+  }
+
+  .source-tab:hover {
+    color: var(--text-primary);
+  }
+
+  .source-tab.active {
+    color: var(--primary-color);
+    border-bottom-color: var(--primary-color);
+  }
+
+  .source-content {
+    display: none;
+  }
+
+  .source-content.active {
+    display: block;
+  }
+
+  /* ==================== Playlist Grid (NEW) ==================== */
+  .playlists-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+    gap: 1.5rem;
+  }
+
+  .playlist-card {
+    border: 2px solid var(--border-color);
+    border-radius: 12px;
+    overflow: hidden;
+    cursor: pointer;
+    transition: var(--transition-smooth);
+  }
+
+  .playlist-card:hover {
+    border-color: var(--primary-color);
+    box-shadow: 0 8px 20px rgba(99, 102, 241, 0.2);
+  }
+
+  .playlist-card input[type="radio"] {
+    display: none;
+  }
+
+  .playlist-card input[type="radio"]:checked + .playlist-card-content {
+    background: rgba(99, 102, 241, 0.1);
+    border-top: 3px solid var(--primary-color);
+  }
+
+  .playlist-card-image {
+    width: 100%;
+    height: 150px;
+    background: rgba(99, 102, 241, 0.1);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-secondary);
+    font-size: 3rem;
+    overflow: hidden;
+  }
+
+  .playlist-card-image img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .playlist-card-content {
+    padding: 1rem;
+    transition: var(--transition-smooth);
+  }
+
+  .playlist-card-title {
+    font-weight: 700;
+    color: var(--text-primary);
+    margin: 0 0 0.5rem 0;
+    font-size: 0.95rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .playlist-card-info {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    margin: 0;
+  }
+
+  .playlists-loading {
+    text-align: center;
+    padding: 2rem;
+    color: var(--text-secondary);
+  }
+
   /* ==================== Toggle Switch ==================== */
   .toggle-switch {
     display: flex;
@@ -747,7 +859,7 @@
               <i class="bi bi-youtube"></i> YouTube Account
               <span class="required">*</span>
             </label>
-            <select name="youtube_account" id="youtube_account" class="form-select" required>
+            <select name="youtube_account" id="youtube_account" class="form-select" required onchange="onYouTubeAccountChange()">
               <option value="">Select YouTube account...</option>
               {% for account in youtube_accounts %}
                 <option value="{{ account.id }}">📺 {{ account.channel_title }}</option>
@@ -755,8 +867,50 @@
             </select>
           </div>
 
-          <!-- Media Files Selection -->
+          <!-- Stream Source Selection (NEW) -->
           <div class="form-section">
+            <label class="form-label">
+              <i class="bi bi-collection"></i> Content Source
+              <span class="required">*</span>
+              <span class="form-help-text">Choose where to stream content from</span>
+            </label>
+            <div style="display: flex; gap: 1rem;">
+              <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer; flex: 1; padding: 1rem; border: 2px solid var(--border-color); border-radius: 10px; transition: var(--transition-smooth);" id="mediaFilesLabel">
+                <input
+                  type="radio"
+                  name="stream_source"
+                  value="media_files"
+                  id="source_media_files"
+                  checked
+                  onchange="onStreamSourceChange()"
+                  style="margin: 0;"
+                >
+                <span>
+                  <strong>Uploaded Media Files</strong>
+                  <br>
+                  <small style="color: var(--text-secondary);">Stream from files you uploaded</small>
+                </span>
+              </label>
+              <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer; flex: 1; padding: 1rem; border: 2px solid var(--border-color); border-radius: 10px; transition: var(--transition-smooth);" id="playlistLabel">
+                <input
+                  type="radio"
+                  name="stream_source"
+                  value="playlist"
+                  id="source_playlist"
+                  onchange="onStreamSourceChange()"
+                  style="margin: 0;"
+                >
+                <span>
+                  <strong>YouTube Playlist</strong>
+                  <br>
+                  <small style="color: var(--text-secondary);">Stream from channel playlist</small>
+                </span>
+              </label>
+            </div>
+          </div>
+
+          <!-- Media Files Selection (UPDATED) -->
+          <div class="form-section" id="mediaFilesSection">
             <label class="form-label">
               <i class="bi bi-collection-play"></i> Media Files
               <span class="required">*</span>
@@ -773,6 +927,7 @@
                       value="{{ media.id }}"
                       id="media_{{ media.id }}"
                       class="media-checkbox"
+                      onchange="validateFormSubmit()"
                     >
 
                     {% if media.thumbnail %}
@@ -804,6 +959,40 @@
               </div>
             {% endif %}
           </div>
+
+          <!-- Playlist Selection (NEW) -->
+          <div class="form-section" id="playlistSection" style="display: none;">
+            <label class="form-label">
+              <i class="bi bi-list-ul"></i> YouTube Playlist
+              <span class="required">*</span>
+              <span class="form-help-text">Select a playlist from your channel</span>
+            </label>
+            
+            <div id="playlistsContainer">
+              <div class="playlists-loading">
+                <i class="bi bi-hourglass-split" style="font-size: 2rem; display: block; margin-bottom: 0.5rem;"></i>
+                Select a YouTube account to load playlists
+              </div>
+            </div>
+
+            <!-- Shuffle Option (NEW) -->
+            <div style="margin-top: 1rem;">
+              <div class="toggle-switch">
+                <input
+                  type="checkbox"
+                  name="shuffle_playlist"
+                  id="shuffle_playlist"
+                >
+                <div>
+                  <label for="shuffle_playlist"><i class="bi bi-shuffle"></i> Shuffle Playlist</label>
+                  <span class="form-help-text">Randomize video order from playlist</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Hidden input for playlist selection -->
+          <input type="hidden" name="playlist_id" id="playlist_id" value="">
 
           <!-- Loop Settings -->
           <div class="form-section">
@@ -841,10 +1030,13 @@
       </div>
       <div class="info-box-content">
         <ul>
+          <li><strong>Choose Content Source:</strong> Stream from uploaded media files or a YouTube channel playlist</li>
+          <li><strong>Media Files:</strong> Select uploaded files in the order you want them to play</li>
+          <li><strong>Playlists:</strong> Select a playlist from your connected YouTube channel - videos will be automatically downloaded</li>
           <li>Upload a custom thumbnail to make your stream more attractive (optional)</li>
           <li>Stream title is required and will appear on YouTube (1-100 characters)</li>
-          <li>Select media files in the order you want them to play</li>
-          <li>Enable Loop to restart playback after all files finish</li>
+          <li>Enable Loop to restart playback after all content finishes</li>
+          <li>Enable Shuffle (for playlists) to randomize video order</li>
           <li>After creation, use "Start Stream" button to go live</li>
           <li>Recommended thumbnail size: 1280x720 pixels (16:9 aspect ratio)</li>
         </ul>
@@ -919,20 +1111,168 @@
     document.getElementById('thumbnailPreview').style.display = 'none';
   }
 
+  // ==================== NEW: Stream Source Switch ====================
+  function onStreamSourceChange() {
+    const isMediaFiles = document.getElementById('source_media_files').checked;
+    const mediaFilesSection = document.getElementById('mediaFilesSection');
+    const playlistSection = document.getElementById('playlistSection');
+    
+    if (isMediaFiles) {
+      mediaFilesSection.style.display = 'block';
+      playlistSection.style.display = 'none';
+    } else {
+      mediaFilesSection.style.display = 'none';
+      playlistSection.style.display = 'block';
+      onYouTubeAccountChange(); // Load playlists
+    }
+    validateFormSubmit();
+  }
+
+  function onYouTubeAccountChange() {
+    const youtubeAccountId = document.getElementById('youtube_account').value;
+    if (!youtubeAccountId) {
+      document.getElementById('playlistsContainer').innerHTML = `
+        <div class="playlists-loading">
+          <i class="bi bi-hourglass-split" style="font-size: 2rem; display: block; margin-bottom: 0.5rem;"></i>
+          Select a YouTube account to load playlists
+        </div>
+      `;
+      return;
+    }
+
+    // Only load if playlist tab is active
+    if (!document.getElementById('source_playlist').checked) {
+      return;
+    }
+
+    loadPlaylists(youtubeAccountId);
+  }
+
+  function loadPlaylists(youtubeAccountId) {
+    const container = document.getElementById('playlistsContainer');
+    container.innerHTML = `
+      <div class="playlists-loading">
+        <i class="bi bi-hourglass-split" style="font-size: 2rem; display: block; margin-bottom: 0.5rem; animation: spin 1s linear infinite;"></i>
+        Loading playlists...
+      </div>
+    `;
+
+    fetch(`/streaming/api/playlists/?youtube_account_id=${youtubeAccountId}`)
+      .then(response => response.json())
+      .then(data => {
+        if (data.error) {
+          container.innerHTML = `
+            <div class="empty-state">
+              <i class="empty-state-icon bi bi-exclamation-triangle"></i>
+              <p class="empty-state-text">Error: ${data.error}</p>
+            </div>
+          `;
+          return;
+        }
+
+        if (data.playlists && data.playlists.length > 0) {
+          let html = '<div class="playlists-grid">';
+          data.playlists.forEach(playlist => {
+            html += `
+              <label class="playlist-card" style="border-color: var(--border-color);">
+                <input 
+                  type="radio" 
+                  name="playlist_select"
+                  value="${playlist.id}"
+                  onchange="selectPlaylist('${playlist.id}', '${playlist.title.replace(/'/g, "\\'")}', this)"
+                >
+                <div class="playlist-card-content">
+                  <div class="playlist-card-image">
+                    ${playlist.thumbnail ? `<img src="${playlist.thumbnail}" alt="${playlist.title}">` : '<i class="bi bi-list-ul"></i>'}
+                  </div>
+                  <p class="playlist-card-title">${playlist.title}</p>
+                  <p class="playlist-card-info"><i class="bi bi-film"></i> ${playlist.item_count} videos</p>
+                </div>
+              </label>
+            `;
+          });
+          html += '</div>';
+          container.innerHTML = html;
+        } else {
+          container.innerHTML = `
+            <div class="empty-state">
+              <i class="empty-state-icon bi bi-inbox"></i>
+              <p class="empty-state-text">No playlists found in this channel</p>
+            </div>
+          `;
+        }
+      })
+      .catch(error => {
+        console.error('Error loading playlists:', error);
+        container.innerHTML = `
+          <div class="empty-state">
+            <i class="empty-state-icon bi bi-exclamation-triangle"></i>
+            <p class="empty-state-text">Failed to load playlists</p>
+          </div>
+        `;
+      });
+  }
+
+  function selectPlaylist(playlistId, playlistTitle, radioElement) {
+    document.getElementById('playlist_id').value = playlistId;
+    
+    // Update all playlist cards styling
+    document.querySelectorAll('.playlist-card').forEach(card => {
+      if (card.querySelector('input[value="' + playlistId + '"]')) {
+        card.style.borderColor = 'var(--primary-color)';
+        card.style.background = 'rgba(99, 102, 241, 0.05)';
+      } else {
+        card.style.borderColor = 'var(--border-color)';
+        card.style.background = 'transparent';
+      }
+    });
+    
+    validateFormSubmit();
+  }
+
+  function validateFormSubmit() {
+    const isMediaFiles = document.getElementById('source_media_files').checked;
+    const mediaCheckboxes = document.querySelectorAll('input[name="media_files"]');
+    const playlistId = document.getElementById('playlist_id').value;
+    
+    let isValid = false;
+    if (isMediaFiles) {
+      isValid = Array.from(mediaCheckboxes).some(cb => cb.checked);
+    } else {
+      isValid = playlistId !== '';
+    }
+    
+    submitBtn.disabled = !isValid;
+  }
+
   // Form submission
   form.addEventListener('submit', (e) => {
-    const checkboxes = document.querySelectorAll('input[name="media_files"]');
-    const isAnyChecked = Array.from(checkboxes).some(cb => cb.checked);
+    const isMediaFiles = document.getElementById('source_media_files').checked;
+    
+    if (isMediaFiles) {
+      const checkboxes = document.querySelectorAll('input[name="media_files"]');
+      const isAnyChecked = Array.from(checkboxes).some(cb => cb.checked);
 
-    if (!isAnyChecked) {
-      e.preventDefault();
-      alert('Please select at least one media file');
-      return;
+      if (!isAnyChecked) {
+        e.preventDefault();
+        alert('Please select at least one media file');
+        return;
+      }
+    } else {
+      const playlistId = document.getElementById('playlist_id').value;
+      if (!playlistId) {
+        e.preventDefault();
+        alert('Please select a playlist');
+        return;
+      }
     }
 
     submitBtn.disabled = true;
     submitBtn.innerHTML = '<span class="loading-spinner"></span> <span>Creating...</span>';
   });
+
+  // Initialize form validation
+  validateFormSubmit();
 </script>
 
 {% endblock %}

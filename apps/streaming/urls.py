@@ -20,5 +20,7 @@ urlpatterns = [
     path('media/upload/', views.media_upload_view, name='media_upload'),
     path('media/delete/<int:media_id>/', views.media_delete_view, name='media_delete'),
     path('media/reorder/', views.media_reorder_view, name='media_reorder'),
-
+    
+    # Playlists API (NEW)
+    path('api/playlists/', views.get_playlists_api, name='get_playlists_api'),
 ]
